@@ -46,6 +46,17 @@ void Bitstream::putbits(std::uint32_t val, int N) {
     cache_      = remaining ? (val << cache_room_) : 0;
 }
 
+void Bitstream::flush_bytes() {
+    int used = 32 - cache_room_;          // bits currently held in cache (MSB-aligned)
+    while (used >= 8) {
+        if (position_ >= buffer_.size()) grow();
+        buffer_[position_++] = static_cast<std::uint8_t>((cache_ >> 24) & 0xFF);
+        cache_    <<= 8;
+        used       -= 8;
+        cache_room_ += 8;
+    }
+}
+
 std::size_t Bitstream::bit_count() const noexcept {
     return position_ * 8 + static_cast<std::size_t>(32 - cache_room_);
 }

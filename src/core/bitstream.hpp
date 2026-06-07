@@ -23,6 +23,13 @@ public:
   /// Write the lower N bits of `val`, MSB first. N must be 0..32.
   void putbits(std::uint32_t val, int N);
 
+  /// Flush all *complete* bytes currently held in the cache into the buffer
+  /// so that data()/byte_position() expose them. Call only at a byte boundary
+  /// (bit_count() % 8 == 0); any partial trailing byte is left in the cache.
+  /// Used by the main_data reservoir, which assembles frames at byte
+  /// granularity.
+  void flush_bytes();
+
   /// Number of bits written since the last reset().
   std::size_t bit_count() const noexcept;
 

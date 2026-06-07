@@ -12,6 +12,7 @@
 #include "quant/quantize.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <memory>
 
@@ -101,6 +102,28 @@ struct Encoder::Impl {
         state.hf_adaptor = std::make_unique<post::HFAdaptor>(
             6000.0, c.hf_max_atten_m_db, c.hf_max_atten_s_db, 25.0, 0.45);
 
+        state.cfg_mask_alpha    = c.mask_alpha;
+        state.cfg_mask_lambda_R = c.mask_lambda_R;
+        state.cfg_lf_strict_db        = c.lf_strict_db;
+        state.cfg_lf_strict_cutoff_hz = c.lf_strict_cutoff_hz;
+        state.pre_gain          = std::pow(10.0, c.pre_gain_db / 20.0);
+        state.hf_weight_boost   = std::max(1.0, c.hf_weight_boost);
+
+        // The bit reservoir is now realised by the cross-frame main_data_begin
+        // mechanism in l3_bitstream + the frame_pool seed in iteration_loop
+        // (state.resv_bytes carries spare main_data across frames). The legacy
+        // ResvMax/ResvSize path in reservoir.cpp is left disabled to avoid
+        // double-counting: max_reservoir_bits returns the equal base share
+        // (mean_bits/channels) and the reservoir is layered on top by the
+        // frame_pool seed.
+        state.ResvMax  = 0;
+        state.ResvSize = 0;
+        // Reset the cross-frame reservoir/FIFO state for this stream.
+        state.md_fifo.clear();
+        state.md_emitted = 0;
+        state.resv_bytes = 0;
+        state.pending_frames.clear();
+
         if (c.abr_target_kbps) {
             control::AbrController::Options o;
             o.target_kbps = *c.abr_target_kbps;
@@ -132,10 +155,49 @@ struct Encoder::Impl {
     }
 
     void run_frame(int stride) {
+        // 1. PCM-domain transient analysis FIRST. This is bitrate-
+        //    independent and produces the flags the ABR hint needs.
+        bool any_transient = false;
+        bool any_afs       = false;
+        bool all_silent    = true;
+        if (state.buffer[0]) {
+            state.transient_gate.analyse_frame(
+                state.buffer[0],
+                samples_per_pass(),
+                state.wave.channels,
+                state.mpeg.granules_per_frame);
+            state.frame_transient_granules = 0;
+            state.frame_min_transient_cutoff_hz = 22050.0;
+            for (int gr = 0; gr < state.mpeg.granules_per_frame; ++gr) {
+                const auto d = state.transient_gate.decision_for(gr);
+                state.transient_flags[gr]    = d.transient;
+                state.pre_window_flags[gr]   = d.pre_window;
+                state.attack_from_silence_flags[gr] = d.attack_from_silence;
+                state.silent_flags[gr]       = d.silent;
+                state.transient_cutoff_hz[gr] = d.cutoff_hz;
+                if (d.transient) {
+                    ++state.frame_transient_granules;
+                    any_transient = true;
+                }
+                if (d.attack_from_silence) any_afs = true;
+                if (!d.silent) all_silent = false;
+                if (d.cutoff_hz < state.frame_min_transient_cutoff_hz)
+                    state.frame_min_transient_cutoff_hz = d.cutoff_hz;
+                // pe[] stays at default 0: bit reservoir is disabled
+                // (see encoder.cpp init). The bitrate index itself now
+                // carries the transient signal via the ABR hint below.
+                for (int ch = 0; ch < state.wave.channels; ++ch)
+                    state.pe[ch][gr] = 0.0;
+            }
+        }
+
+        // 2. ABR picks the bitrate, biased by the transient hint.
         if (abr) {
+            abr->set_transient_hint(any_afs, any_transient, all_silent);
             control::switch_bitrate(state, abr->next_target_kbps());
         }
         recompute_frame_timing();
+
         mdct::analyse(state, stride);
         quant::iteration_loop(state);
         l3::format_bitstream(state);
@@ -163,6 +225,14 @@ struct Encoder::Impl {
         last_stats.hf_rdo_bits_saved = state.frame_hf_rdo_saved;
         last_stats.lpf_side_hz = post::lowpass_side_cutoff_hz(state.mpeg.bitr);
         if (state.hf_adaptor) last_stats.hf = state.hf_adaptor->state();
+        last_stats.transient_granules  = state.frame_transient_granules;
+        last_stats.transient_cutoff_hz = state.frame_min_transient_cutoff_hz;
+        last_stats.attack_from_silence_granules = 0;
+        for (int gr = 0; gr < state.mpeg.granules_per_frame; ++gr)
+            if (state.attack_from_silence_flags[gr])
+                ++last_stats.attack_from_silence_granules;
+        last_stats.mask_alpha    = state.mask_params.alpha;
+        last_stats.mask_lambda_R = state.mask_params.lambda_R;
 
         // Feed the closing-loop controllers.
         if (state.hf_adaptor) state.hf_adaptor->observe(last_stats);

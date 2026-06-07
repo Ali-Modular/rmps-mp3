@@ -24,6 +24,51 @@ std::uint16_t read_le16(std::istream& s) {
     return std::uint16_t(b[0]) | std::uint16_t(b[1] << 8);
 }
 
+/// Decode one interleaved source sample at `p` to a signed 16-bit value,
+/// according to the source bit depth / float flag. Integer formats are
+/// arithmetically right-shifted (high bits kept); float is scaled and clamped.
+std::int16_t decode_sample(const std::uint8_t* p, int bits, bool is_float) {
+    auto from_double = [](double d) -> std::int16_t {
+        d = std::clamp(d, -1.0, 1.0);
+        long v = std::lround(d * 32767.0);
+        return static_cast<std::int16_t>(std::clamp<long>(v, -32768, 32767));
+    };
+    if (is_float) {
+        if (bits == 64) {
+            double d; std::memcpy(&d, p, 8);
+            return from_double(d);
+        }
+        float f; std::memcpy(&f, p, 4);
+        return from_double(static_cast<double>(f));
+    }
+    switch (bits) {
+        case 8: // WAV 8-bit PCM is unsigned, centred at 128
+            return static_cast<std::int16_t>((static_cast<int>(p[0]) - 128) << 8);
+        case 16:
+            return static_cast<std::int16_t>(
+                static_cast<std::uint16_t>(p[0]) |
+                static_cast<std::uint16_t>(p[1]) << 8);
+        case 24: {
+            // Place the 24 bits in the top of a 32-bit word, then shift down
+            // arithmetically to sign-extend, and again to reach 16-bit.
+            std::int32_t v = static_cast<std::int32_t>(
+                static_cast<std::uint32_t>(p[0]) << 8  |
+                static_cast<std::uint32_t>(p[1]) << 16 |
+                static_cast<std::uint32_t>(p[2]) << 24);
+            return static_cast<std::int16_t>((v >> 8) >> 8);
+        }
+        case 32: {
+            std::int32_t v = static_cast<std::int32_t>(
+                static_cast<std::uint32_t>(p[0])       |
+                static_cast<std::uint32_t>(p[1]) << 8  |
+                static_cast<std::uint32_t>(p[2]) << 16 |
+                static_cast<std::uint32_t>(p[3]) << 24);
+            return static_cast<std::int16_t>(v >> 16);
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 Reader::Reader() = default;
@@ -57,13 +102,37 @@ std::unique_ptr<Reader> Reader::open(const std::string& path) {
             (void)read_le32(r->file_);          // byte rate
             (void)read_le16(r->file_);          // block align
             std::uint16_t bps      = read_le16(r->file_);
-            if (chunk_sz > 16) r->file_.seekg(chunk_sz - 16, std::ios::cur);
-            if (fmt_tag != 1)
-                throw std::runtime_error("only PCM (fmt 1) WAV supported");
-            if (bps != 16)
-                throw std::runtime_error("only 16-bit WAV supported");
+            std::uint32_t consumed = 16;
+            // For WAVE_FORMAT_EXTENSIBLE the real sample format lives in the
+            // first two bytes of the SubFormat GUID inside the extension.
+            std::uint16_t actual_fmt = fmt_tag;
+            if (fmt_tag == 0xFFFE) {
+                std::uint16_t cb = read_le16(r->file_); consumed += 2;
+                if (cb >= 22) {
+                    (void)read_le16(r->file_);        // valid bits per sample
+                    (void)read_le32(r->file_);        // channel mask
+                    actual_fmt = read_le16(r->file_); // SubFormat GUID lead bytes
+                    consumed += 8;
+                }
+            }
+            if (chunk_sz > consumed)
+                r->file_.seekg(chunk_sz - consumed, std::ios::cur);
+
+            constexpr std::uint16_t WAVE_PCM   = 1;
+            constexpr std::uint16_t WAVE_FLOAT = 3;
+            const bool is_float = (actual_fmt == WAVE_FLOAT);
+            if (actual_fmt != WAVE_PCM && actual_fmt != WAVE_FLOAT)
+                throw std::runtime_error("unsupported WAV format (only PCM / IEEE float)");
+            if (is_float) {
+                if (bps != 32 && bps != 64)
+                    throw std::runtime_error("float WAV must be 32- or 64-bit");
+            } else if (bps != 8 && bps != 16 && bps != 24 && bps != 32) {
+                throw std::runtime_error("PCM WAV must be 8/16/24/32-bit");
+            }
             if (r->src_channels_ < 1 || r->src_channels_ > 2)
                 throw std::runtime_error("only mono/stereo WAV supported");
+            r->src_bits_  = bps;
+            r->src_float_ = is_float;
             got_fmt = true;
         } else if (std::memcmp(chunk_id, "data", 4) == 0) {
             r->data_remaining_bytes_ = chunk_sz;
@@ -76,7 +145,8 @@ std::unique_ptr<Reader> Reader::open(const std::string& path) {
     if (!got_fmt || !got_data) throw std::runtime_error("missing fmt/data chunk");
 
     const int src_ch = r->src_channels_;
-    const std::uint32_t frame_bytes = static_cast<std::uint32_t>(src_ch) * 2u;
+    const std::uint32_t frame_bytes =
+        static_cast<std::uint32_t>(src_ch) * (static_cast<std::uint32_t>(r->src_bits_) / 8u);
     r->info_.total_frames = r->data_remaining_bytes_ / frame_bytes;
     r->info_.channels     = 2;       // we always emit stereo
     r->info_.duration_s   = static_cast<double>(r->info_.total_frames)
@@ -86,25 +156,30 @@ std::unique_ptr<Reader> Reader::open(const std::string& path) {
 
 std::size_t Reader::read(std::int16_t* out, std::size_t frames) {
     if (data_remaining_bytes_ == 0) return 0;
-    const std::uint32_t frame_bytes = static_cast<std::uint32_t>(src_channels_) * 2u;
+    const std::uint32_t bytes_per_sample = static_cast<std::uint32_t>(src_bits_) / 8u;
+    const std::uint32_t frame_bytes =
+        static_cast<std::uint32_t>(src_channels_) * bytes_per_sample;
     const std::uint32_t max_frames  = data_remaining_bytes_ / frame_bytes;
     if (frames > max_frames) frames = max_frames;
     if (frames == 0) return 0;
 
-    if (src_channels_ == 2) {
-        file_.read(reinterpret_cast<char*>(out),
-                   static_cast<std::streamsize>(frames * frame_bytes));
-        data_remaining_bytes_ -= static_cast<std::uint32_t>(frames * frame_bytes);
-        return frames;
-    }
-    // mono -> stereo up-mix via duplicate
-    if (scratch_.size() < frames) scratch_.resize(frames);
-    file_.read(reinterpret_cast<char*>(scratch_.data()),
-               static_cast<std::streamsize>(frames * 2u));
-    data_remaining_bytes_ -= static_cast<std::uint32_t>(frames * 2u);
+    const std::size_t want_bytes = frames * frame_bytes;
+    if (raw_.size() < want_bytes) raw_.resize(want_bytes);
+    file_.read(reinterpret_cast<char*>(raw_.data()),
+               static_cast<std::streamsize>(want_bytes));
+    data_remaining_bytes_ -= static_cast<std::uint32_t>(want_bytes);
+
+    const std::uint8_t* p = raw_.data();
     for (std::size_t i = 0; i < frames; ++i) {
-        out[2*i    ] = scratch_[i];
-        out[2*i + 1] = scratch_[i];
+        const std::int16_t l = decode_sample(p, src_bits_, src_float_);
+        p += bytes_per_sample;
+        std::int16_t r = l;                       // mono -> duplicate
+        if (src_channels_ == 2) {
+            r = decode_sample(p, src_bits_, src_float_);
+            p += bytes_per_sample;
+        }
+        out[2*i    ] = l;
+        out[2*i + 1] = r;
     }
     return frames;
 }

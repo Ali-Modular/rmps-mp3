@@ -1,3 +1,11 @@
+// Define before ANY include so a transitive <windows.h> never defines the
+// min()/max() macros that would clobber std::min / std::max used below.
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
 #include "tui.hpp"
 
 #include <algorithm>
@@ -152,6 +160,13 @@ void Live::on_frame(const FrameStats &fs, const AbrState *abr,
   if (fs.hf_rdo_bits_saved) {
     s << "  " << CYAN << "HF RDO" << RESET << "      " << GREEN << "-"
       << fs.hf_rdo_bits_saved << " bits" << RESET << "\n";
+  }
+  if (fs.transient_granules > 0) {
+    s << "  " << RED << "PRE-ECHO GATE" << RESET
+      << "  " << fs.transient_granules << " granule"
+      << (fs.transient_granules > 1 ? "s" : "")
+      << " gated, cutoff " << std::setprecision(1)
+      << (fs.transient_cutoff_hz / 1000.0) << " kHz\n";
   }
 
   const std::string buf = s.str();

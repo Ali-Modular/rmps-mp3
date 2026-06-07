@@ -28,6 +28,7 @@ int final_bits(int* ix_full, GrInfo& tmp, EncoderState& s) {
 
 int hf_rdo(int* ix_full, int& cur_bits,
            std::vector<double>& dist_band,
+           std::vector<double>& raw_band,
            int huff_budget,
            int gain, int scale, int preflag,
            const std::array<const std::int32_t*, NUM_SFB_LONG>& xr_bands,
@@ -37,7 +38,8 @@ int hf_rdo(int* ix_full, int& cur_bits,
            const std::array<double, 21>& weights,
            EncoderState& s,
            GrInfo& tmp_gi,
-           int hf_start_sfb) {
+           int hf_start_sfb,
+           int hf_end_sfb) {
     (void)xrabs_bands;
     const std::int64_t scalei_global = s.steptabi[gain + 127];
 
@@ -55,7 +57,8 @@ int hf_rdo(int* ix_full, int& cur_bits,
 
     int total_saved = 0;
 
-    for (int sfb = hf_start_sfb; sfb < NUM_SFB_LONG; ++sfb) {
+    const int sfb_end = std::min(hf_end_sfb, NUM_SFB_LONG);
+    for (int sfb = hf_start_sfb; sfb < sfb_end; ++sfb) {
         // Effective shift = (sf + preflag*pretab) * (1+scale). We don't have sf
         // here — caller already produced ix using a given sf, so we re-derive
         // shift from gi by replaying the band's quantizer parameters via the
@@ -130,6 +133,11 @@ int hf_rdo(int* ix_full, int& cur_bits,
         auto accept = [&](double dist_inc) {
             cur_bits = trial_bits;
             dist_band[static_cast<std::size_t>(sfb)] += dist_inc;
+            // dist_change is `(trial_err2 - cur_err2) * w`, so the raw band
+            // noise delta is `dist_inc / w`. Update raw_band so callers can
+            // still recover an honest raw SDR after the polish.
+            if (w > 1e-12)
+                raw_band[static_cast<std::size_t>(sfb)] += dist_inc / w;
             tmp_gi = trial_gi;
             total_saved += delta;
         };

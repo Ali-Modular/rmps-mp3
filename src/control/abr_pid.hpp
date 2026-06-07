@@ -31,7 +31,18 @@ public:
     void observe(int frame_bits, double frame_seconds,
                  std::optional<double> frame_sdr_db);
 
-    /// Next-frame kbps target (last decision).
+    /// Lookahead hint from the transient gate, supplied AFTER the PCM
+    /// has been analysed but BEFORE next_target_kbps() is consumed.
+    /// Overrides the PID's natural decision for the upcoming frame:
+    ///   attack_from_silence → jump to max_kbps (kill pre-echo)
+    ///   any_transient       → bias halfway toward max_kbps
+    ///   all_silent          → bias halfway toward min_kbps
+    /// Long-term average is restored by the PID's integral after the
+    /// burst is observed.
+    void set_transient_hint(bool attack_from_silence, bool any_transient,
+                            bool all_silent) noexcept;
+
+    /// Next-frame kbps target (last decision, after any transient hint).
     double next_target_kbps() const noexcept { return last_decision_kbps_; }
 
     AbrState state() const noexcept;

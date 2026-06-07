@@ -15,8 +15,10 @@ struct WavInfo {
     double duration_s   = 0.0;
 };
 
-/// Streaming 16-bit PCM WAV reader. Always emits interleaved stereo (mono is
-/// up-mixed by duplication) so the encoder pipeline stays consistent.
+/// Streaming PCM/float WAV reader. Accepts 8/16/24/32-bit integer PCM and
+/// 32/64-bit IEEE float (incl. WAVE_FORMAT_EXTENSIBLE), down-converting every
+/// source sample to 16-bit for the encoder pipeline. Always emits interleaved
+/// stereo (mono is up-mixed by duplication) so the pipeline stays consistent.
 class Reader {
 public:
     static std::unique_ptr<Reader> open(const std::string& path);
@@ -34,8 +36,10 @@ private:
     WavInfo info_ {};
     std::ifstream file_;
     int           src_channels_ = 0;
+    int           src_bits_     = 16;     ///< bits per source sample (8/16/24/32/64)
+    bool          src_float_    = false;  ///< true for IEEE float source samples
     std::uint32_t data_remaining_bytes_ = 0;
-    std::vector<std::int16_t> scratch_;
+    std::vector<std::uint8_t> raw_;       ///< interleaved raw source-byte scratch
 };
 
 /// Synthesised stereo sine (440 Hz L / 450 Hz R) source for smoke tests.

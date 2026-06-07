@@ -51,6 +51,18 @@ struct FrameStats {
     int    hf_rdo_bits_saved = 0;
     HFAdaptorState hf {};
     double lpf_side_hz       = 0.0;
+    /// PCM-driven transient gate: how many granules in this frame were
+    /// flagged as containing a transient, and the most aggressive cutoff
+    /// applied to any of them. 22050 = no cutoff applied.
+    int    transient_granules = 0;
+    double transient_cutoff_hz = 22050.0;
+    /// Number of granules this frame flagged as attack-from-silence (a
+    /// subset of `transient_granules`). These get the deepest HF cut and
+    /// the largest pre-mask penalty in the masking model.
+    int    attack_from_silence_granules = 0;
+    /// Active beam-search cost mix and rate-distortion lambda.
+    double mask_alpha    = 0.0;
+    double mask_lambda_R = 0.0;
 };
 
 } // namespace rmps

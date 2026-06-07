@@ -50,7 +50,9 @@ add_library(rmps STATIC
     src/post/ms_stereo.cpp
     src/post/lowpass.cpp
     src/post/hf_adaptor.cpp
+    src/post/masking.cpp
     src/control/abr_pid.cpp
+    src/control/transient_gate.cpp
     src/encoder.cpp
 )
 target_include_directories(rmps

@@ -72,10 +72,10 @@ void huffman_coder_count1(Bitstream& bs, const huffman::Table& h,
     bs.putbits(code, cb);
 }
 
-void huffman_code_bits(EncoderState& s, int* ix, GrInfo& gi) {
+void huffman_code_bits(EncoderState& s, Bitstream& bs, int* ix, GrInfo& gi) {
     const auto& sfb = tables::scale_fact_band_index[s.mpeg.samplerate_index];
 
-    const std::size_t start_bits = s.bs.bit_count();
+    const std::size_t start_bits = bs.bit_count();
     const int bigvalues = gi.big_values << 1;
 
     int scalefac_index = gi.region0_count + 1;
@@ -86,30 +86,29 @@ void huffman_code_bits(EncoderState& s, int* ix, GrInfo& gi) {
     for (int i = 0; i < bigvalues; i += 2) {
         const int region = (i >= region1Start ? 1 : 0) + (i >= region2Start ? 1 : 0);
         const int t = gi.table_select[region];
-        if (t) huffman_code(s.bs, t, ix[i], ix[i + 1]);
+        if (t) huffman_code(bs, t, ix[i], ix[i + 1]);
     }
 
     // Count1 region (quadruples).
     const auto& h = huffman::at(gi.count1table_select + 32);
     const int count1End = bigvalues + (gi.count1 << 2);
     for (int i = bigvalues; i < count1End; i += 4) {
-        huffman_coder_count1(s.bs, h, ix[i], ix[i + 1], ix[i + 2], ix[i + 3]);
+        huffman_coder_count1(bs, h, ix[i], ix[i + 1], ix[i + 2], ix[i + 3]);
     }
 
     // Stuffing bits (if part2_3_length declared more than actually written).
-    std::int64_t bits = static_cast<std::int64_t>(s.bs.bit_count())
+    std::int64_t bits = static_cast<std::int64_t>(bs.bit_count())
                       - static_cast<std::int64_t>(start_bits);
     std::int64_t want = gi.part2_3_length - gi.part2_length - bits;
     if (want > 0) {
         const int stuffingWords = static_cast<int>(want / 32);
         const int remaining     = static_cast<int>(want % 32);
-        for (int i = 0; i < stuffingWords; ++i) s.bs.putbits(0xFFFFFFFFu, 32);
-        if (remaining > 0) s.bs.putbits((1u << remaining) - 1u, remaining);
+        for (int i = 0; i < stuffingWords; ++i) bs.putbits(0xFFFFFFFFu, 32);
+        if (remaining > 0) bs.putbits((1u << remaining) - 1u, remaining);
     }
 }
 
-void encode_side_info(EncoderState& s) {
-    auto& bs   = s.bs;
+void encode_side_info(EncoderState& s, Bitstream& bs, int main_data_begin) {
     auto& si   = s.side_info;
     auto& mpeg = s.mpeg;
 
@@ -128,11 +127,11 @@ void encode_side_info(EncoderState& s) {
     bs.putbits(static_cast<std::uint32_t>(mpeg.emph), 2);
 
     if (mpeg.version == 3) {
-        bs.putbits(0, 9);
+        bs.putbits(static_cast<std::uint32_t>(main_data_begin), 9);
         if (s.wave.channels == 2) bs.putbits(static_cast<std::uint32_t>(si.private_bits), 3);
         else                      bs.putbits(static_cast<std::uint32_t>(si.private_bits), 5);
     } else {
-        bs.putbits(0, 8);
+        bs.putbits(static_cast<std::uint32_t>(main_data_begin), 8);
         if (s.wave.channels == 2) bs.putbits(static_cast<std::uint32_t>(si.private_bits), 2);
         else                      bs.putbits(static_cast<std::uint32_t>(si.private_bits), 1);
     }
@@ -166,7 +165,7 @@ void encode_side_info(EncoderState& s) {
     }
 }
 
-void encode_main_data(EncoderState& s) {
+void encode_main_data(EncoderState& s, Bitstream& md) {
     auto& si = s.side_info;
 
     for (int gr = 0; gr < s.mpeg.granules_per_frame; ++gr) {
@@ -178,15 +177,15 @@ void encode_main_data(EncoderState& s) {
             auto& scf = si.scfsi[ch];
 
             if (gr == 0 || scf[0] == 0)
-                for (int sfb = 0; sfb < 6;  ++sfb) s.bs.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen1);
+                for (int sfb = 0; sfb < 6;  ++sfb) md.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen1);
             if (gr == 0 || scf[1] == 0)
-                for (int sfb = 6; sfb < 11; ++sfb) s.bs.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen1);
+                for (int sfb = 6; sfb < 11; ++sfb) md.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen1);
             if (gr == 0 || scf[2] == 0)
-                for (int sfb = 11; sfb < 16;++sfb) s.bs.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen2);
+                for (int sfb = 11; sfb < 16;++sfb) md.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen2);
             if (gr == 0 || scf[3] == 0)
-                for (int sfb = 16; sfb < 21;++sfb) s.bs.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen2);
+                for (int sfb = 16; sfb < 21;++sfb) md.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen2);
 
-            huffman_code_bits(s, ix.data(), gi);
+            huffman_code_bits(s, md, ix.data(), gi);
         }
     }
 }
@@ -204,8 +203,18 @@ void format_bitstream(EncoderState& s) {
             }
         }
     }
-    encode_side_info(s);
-    encode_main_data(s);
+
+    // Self-contained per-frame emission (main_data_begin = 0). The cross-frame
+    // reservoir was removed: it corrupted decoded audio because the
+    // main_data_begin byte accounting could drift, and the encoder's internal
+    // quantization is already excellent without it.
+    encode_side_info(s, s.bs, /*main_data_begin=*/0);
+    encode_main_data(s, s.bs);
+}
+
+void flush_bitstream(EncoderState& s) {
+    // No buffered frames in the self-contained emission model.
+    (void)s;
 }
 
 } // namespace rmps::l3

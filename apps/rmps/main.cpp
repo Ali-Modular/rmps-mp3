@@ -27,6 +27,7 @@ struct CliOpts {
     std::string input;            // empty => synth sine
     std::string output = "out.mp3";
     int    bitrate     = 128;
+    bool   cbr_explicit = false;  // user passed -b/--bitrate
     double duration_s  = 2.0;
     double freq_hz     = 440.0;
     std::optional<double> shaping;
@@ -34,6 +35,9 @@ struct CliOpts {
     std::optional<int>    abr_min;
     std::optional<int>    abr_max;
     std::optional<double> target_sdr_db;
+    std::optional<double> pre_gain_db;
+    std::optional<double> hf_weight_boost;
+    std::optional<double> lf_strict_db;
     std::optional<std::string> pid;
 };
 
@@ -45,21 +49,28 @@ void usage(std::FILE* out) {
         "  rmps [options]\n"
         "\n"
         "INPUT / OUTPUT\n"
-        "  -i, --input  PATH       16-bit PCM WAV. Omit for a 2 s 440 Hz sine.\n"
+        "  -i, --input  PATH       PCM/float WAV (8/16/24/32-bit int, 32/64-bit\n"
+        "                          float). Omit for a 2 s 440 Hz sine.\n"
         "  -o, --output PATH       MP3 output. Use '-' to stream to stdout.\n"
-        "  -b, --bitrate KBPS      CBR target (ignored when --abr is set). [128]\n"
         "  -d, --duration SECS     synth duration (no effect with --input). [2.0]\n"
         "      --freq HZ           synth left-channel frequency. [440]\n"
         "\n"
-        "QUALITY KNOBS\n"
-        "      --shaping ALPHA     noise-shaping coefficient in [0..0.95]. [0.5]\n"
-        "\n"
-        "ABR / PID\n"
-        "      --abr KBPS          enable ABR with target average bitrate.\n"
+        "RATE CONTROL  (default: ABR @ 128 kbps)\n"
+        "      --abr KBPS          ABR target average bitrate.\n"
+        "  -b, --bitrate KBPS      CBR at KBPS (opt out of ABR).\n"
         "      --abr-min KBPS      lower clamp (default target/2).\n"
-        "      --abr-max KBPS      upper clamp (default target*8/5).\n"
+        "      --abr-max KBPS      upper clamp (default target*2.5).\n"
         "      --target-sdr DB     defend a perceptual SDR floor when ABR is on.\n"
         "      --pid Kp,Ki,Kd      override PID gains. [0.5,0.12,0.04]\n"
+        "\n"
+        "QUALITY KNOBS\n"
+        "      --shaping ALPHA     noise-shaping coefficient in [0..0.95]. [0.5]\n"
+        "      --pre-gain DB       input PCM attenuation in dB (compensates a\n"
+        "                          structural +~2 dB shift in the pipeline). [-2.0]\n"
+        "      --hf-boost N        per-band weight multiplier for SFB 17–20\n"
+        "                          (~7–16 kHz). >1 preserves hi-hat sizzle. [2.5]\n"
+        "      --lf-strict DB      lower the masking threshold below 1 kHz by DB,\n"
+        "                          spending more bits on clean bass. 0=off. [10]\n"
         "\n"
         "MISC\n"
         "  -h, --help              show this help.\n"
@@ -90,10 +101,13 @@ int parse_args(int argc, char** argv, CliOpts& opts) {
         }
         if (a == "-i" || a == "--input")    { auto v = need(i); if (!v) return 2; opts.input    = v; ++i; }
         else if (a == "-o" || a == "--output"){ auto v = need(i); if (!v) return 2; opts.output  = v; ++i; }
-        else if (a == "-b" || a == "--bitrate") { auto v = need(i); if (!v) return 2; if (!parse_int(v, opts.bitrate)) return 2; ++i; }
+        else if (a == "-b" || a == "--bitrate") { auto v = need(i); if (!v) return 2; if (!parse_int(v, opts.bitrate)) return 2; opts.cbr_explicit = true; ++i; }
         else if (a == "-d" || a == "--duration"){ auto v = need(i); if (!v) return 2; if (!parse_double(v, opts.duration_s)) return 2; ++i; }
         else if (a == "--freq")             { auto v = need(i); if (!v) return 2; if (!parse_double(v, opts.freq_hz)) return 2; ++i; }
         else if (a == "--shaping")          { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.shaping = d; ++i; }
+        else if (a == "--pre-gain")         { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.pre_gain_db = d; ++i; }
+        else if (a == "--hf-boost")         { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.hf_weight_boost = d; ++i; }
+        else if (a == "--lf-strict")        { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.lf_strict_db = d; ++i; }
         else if (a == "--abr")              { auto v = need(i); if (!v) return 2; int d; if (!parse_int(v, d)) return 2; opts.abr_kbps = d; ++i; }
         else if (a == "--abr-min")          { auto v = need(i); if (!v) return 2; int d; if (!parse_int(v, d)) return 2; opts.abr_min = d; ++i; }
         else if (a == "--abr-max")          { auto v = need(i); if (!v) return 2; int d; if (!parse_int(v, d)) return 2; opts.abr_max = d; ++i; }
@@ -140,6 +154,15 @@ std::unique_ptr<OutSink> open_output(const std::string& path) {
 int main(int argc, char** argv) {
     CliOpts opts;
     if (int rc = parse_args(argc, argv, opts); rc != 0) return rc;
+
+    // Default to ABR unless the user explicitly opted into CBR via `-b`.
+    // ABR is preferred because it lets attack frames spend up to ~2.5x
+    // the target bitrate (killing pre-echo) and silence frames much
+    // less, with the PID maintaining the long-term average — and it
+    // does this without a bit reservoir.
+    if (!opts.cbr_explicit && !opts.abr_kbps) {
+        opts.abr_kbps = opts.bitrate;  // default 128
+    }
 
     std::ostream& ui_stream = (opts.output == "-") ? std::cerr : std::cout;
 
@@ -201,6 +224,9 @@ int main(int argc, char** argv) {
     if (opts.target_sdr_db) ccfg.target_sdr_db   = *opts.target_sdr_db;
     if (opts.shaping)       ccfg.noise_shaping_alpha =
         std::clamp(*opts.shaping, 0.0, 0.95);
+    if (opts.pre_gain_db)   ccfg.pre_gain_db = *opts.pre_gain_db;
+    if (opts.hf_weight_boost) ccfg.hf_weight_boost = *opts.hf_weight_boost;
+    if (opts.lf_strict_db)    ccfg.lf_strict_db    = *opts.lf_strict_db;
     auto encoder = rmps::Encoder::create(ccfg);
     if (!encoder) {
         std::fprintf(stderr, "rmps: unsupported samplerate/bitrate combo\n");

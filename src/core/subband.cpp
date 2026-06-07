@@ -35,9 +35,13 @@ void window_filter(int ch, int* out, EncoderState& s, int stride) {
     const std::int16_t* ptr = s.buffer[ch];
     std::size_t buf_idx     = s.buffer_idx[ch];
 
-    // Replace 32 oldest samples with 32 new (in reverse).
+    // Replace 32 oldest samples with 32 new (in reverse). Apply input
+    // pre-gain here as a multiply on the int16 sample before promotion
+    // to int32 — keeps the int domain headroom intact.
+    const double pre_gain = s.pre_gain;
     for (int i = 31; i >= 0; --i) {
-        x_ch[i + off] = fx::i32(static_cast<std::int64_t>(ptr[buf_idx]) << 16);
+        const double scaled = static_cast<double>(ptr[buf_idx]) * pre_gain;
+        x_ch[i + off] = fx::i32(static_cast<std::int64_t>(scaled) << 16);
         buf_idx += static_cast<std::size_t>(stride);
     }
     s.buffer_idx[ch] = buf_idx;
