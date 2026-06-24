@@ -49,6 +49,9 @@ struct MaskingParams {
     /// alone.
     double inter_frame_tonality_weight = 0.6;
 
+    /// Waveform preservation regularization strength (0..1.0).
+    double waveform_reg = 0.05;
+
     /// Low-frequency strictness. Lowers the masking threshold of bands at or
     /// below `lf_strict_cutoff_hz` by `lf_strict_db` dB, which forces the
     /// beam search to demand lower quantization noise (≈ more bits) there.
@@ -58,6 +61,22 @@ struct MaskingParams {
     /// ~1 Bark above the cutoff to avoid an audible band-edge discontinuity.
     double lf_strict_db        = 10.0;
     double lf_strict_cutoff_hz = 1000.0;
+
+    // --- Pre-echo SFB-dependent penalty ---
+    // High frequencies expose pre-echo more audibly because:
+    //   (a) HF has less simultaneous masking from musical content
+    //   (b) The ear's temporal resolution is finer at HF
+    // These multipliers scale the base pre_mask penalty per SFB region.
+    /// SFB 0–10: base penalty (1.0x)
+    double pre_echo_hf_penalty_lo = 1.0;
+    /// SFB 11–16: mid-upper penalty
+    double pre_echo_hf_penalty_mid = 1.8;
+    /// SFB 17–20: HF penalty (strongest)
+    double pre_echo_hf_penalty_hi = 3.0;
+    /// Exponent for the energy-contrast scaling. The pre-mask penalty is
+    /// multiplied by (energy_contrast)^pre_echo_contrast_exponent so
+    /// sharper transients get stronger suppression. 0.0 = ignore contrast.
+    double pre_echo_contrast_exponent = 0.3;
 };
 
 /// Per-channel temporal state for the masking model. One per channel,

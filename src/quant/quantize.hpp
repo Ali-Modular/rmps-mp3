@@ -15,6 +15,13 @@ int quantize(int* ix, int stepsize, EncoderState& s);
 void calc_runlen      (int* ix, GrInfo& gi);
 int  count1_bitcount  (int* ix, GrInfo& gi);
 void subdivide        (GrInfo& gi, EncoderState& s);
+/// RD-optimal big-values region split: exhaustively searches
+/// (region0_count, region1_count) over scalefactor-band boundaries and picks
+/// the joint region/table assignment minimising the big-values Huffman bits.
+/// Requires calc_runlen() to have set gi.big_values. Writes region counts,
+/// addresses and table_select into `gi` and returns the big-values bit count.
+/// Strictly never produces more bits than the fixed-table subdivide() path.
+int  best_subdivide_rd(int* ix, GrInfo& gi, EncoderState& s);
 void bigv_tab_select  (int* ix, GrInfo& gi);
 int  bigv_bitcount    (int* ix, const GrInfo& gi);
 int  count_bit        (int* ix, int start, int end, int table);

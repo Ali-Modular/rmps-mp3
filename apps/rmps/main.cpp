@@ -38,7 +38,10 @@ struct CliOpts {
     std::optional<double> pre_gain_db;
     std::optional<double> hf_weight_boost;
     std::optional<double> lf_strict_db;
+    std::optional<double> waveform_reg;
     std::optional<std::string> pid;
+    bool   block_switching = true; // short blocks on transients (--no-short-blocks)
+    double short_block_hf_threshold = 5.0; // HF/bass energy ratio gate for short blocks
 };
 
 void usage(std::FILE* out) {
@@ -71,6 +74,12 @@ void usage(std::FILE* out) {
         "                          (~7–16 kHz). >1 preserves hi-hat sizzle. [2.5]\n"
         "      --lf-strict DB      lower the masking threshold below 1 kHz by DB,\n"
         "                          spending more bits on clean bass. 0=off. [10]\n"
+        "      --waveform-reg VAL  waveform preservation regularization in [0..1.0]. [0.05]\n"
+        "      --no-short-blocks   disable short-block window switching on\n"
+        "                          transients (long blocks only). [enabled]\n"
+        "      --short-hf-threshold F  min HF-to-bass energy ratio for a\n"
+        "                          transient to use a short block. Higher keeps\n"
+        "                          bass-heavy hits (kicks) on long blocks. [5.0]\n"
         "\n"
         "MISC\n"
         "  -h, --help              show this help.\n"
@@ -108,11 +117,15 @@ int parse_args(int argc, char** argv, CliOpts& opts) {
         else if (a == "--pre-gain")         { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.pre_gain_db = d; ++i; }
         else if (a == "--hf-boost")         { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.hf_weight_boost = d; ++i; }
         else if (a == "--lf-strict")        { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.lf_strict_db = d; ++i; }
+        else if (a == "--waveform-reg")     { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.waveform_reg = d; ++i; }
         else if (a == "--abr")              { auto v = need(i); if (!v) return 2; int d; if (!parse_int(v, d)) return 2; opts.abr_kbps = d; ++i; }
         else if (a == "--abr-min")          { auto v = need(i); if (!v) return 2; int d; if (!parse_int(v, d)) return 2; opts.abr_min = d; ++i; }
         else if (a == "--abr-max")          { auto v = need(i); if (!v) return 2; int d; if (!parse_int(v, d)) return 2; opts.abr_max = d; ++i; }
         else if (a == "--target-sdr")       { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.target_sdr_db = d; ++i; }
         else if (a == "--pid")              { auto v = need(i); if (!v) return 2; opts.pid = std::string(v); ++i; }
+        else if (a == "--no-short-blocks")  { opts.block_switching = false; }
+        else if (a == "--short-blocks")     { opts.block_switching = true; }
+        else if (a == "--short-hf-threshold"){ auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.short_block_hf_threshold = d; ++i; }
         else {
             std::fprintf(stderr, "rmps: unknown option %s (try --help)\n", a.c_str());
             return 2;
@@ -227,6 +240,17 @@ int main(int argc, char** argv) {
     if (opts.pre_gain_db)   ccfg.pre_gain_db = *opts.pre_gain_db;
     if (opts.hf_weight_boost) ccfg.hf_weight_boost = *opts.hf_weight_boost;
     if (opts.lf_strict_db)    ccfg.lf_strict_db    = *opts.lf_strict_db;
+    if (opts.waveform_reg)    ccfg.waveform_reg    = *opts.waveform_reg;
+    ccfg.block_switching = opts.block_switching;
+    ccfg.short_block_hf_threshold = opts.short_block_hf_threshold;
+    if (opts.pid) {
+        double kp = 0.0, ki = 0.0, kd = 0.0;
+        if (std::sscanf(opts.pid->c_str(), "%lf,%lf,%lf", &kp, &ki, &kd) == 3) {
+            ccfg.abr_kp = kp;
+            ccfg.abr_ki = ki;
+            ccfg.abr_kd = kd;
+        }
+    }
     auto encoder = rmps::Encoder::create(ccfg);
     if (!encoder) {
         std::fprintf(stderr, "rmps: unsupported samplerate/bitrate combo\n");

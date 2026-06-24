@@ -226,9 +226,25 @@ MaskingParams make_masking_params(const EncoderState& s) {
         const double br = static_cast<double>(s.mpeg.bitr);
         p.lambda_R = std::max(0.0, (128.0 - br) / 128.0) * 1.0e9;
     }
-    p.alpha = std::clamp(s.cfg_mask_alpha, 0.0, 1.0);
-    p.lf_strict_db        = std::max(0.0, s.cfg_lf_strict_db);
+    
+    double alpha = s.cfg_mask_alpha;
+    double strict_db = s.cfg_lf_strict_db;
+    if (s.mpeg.bitr < 128) {
+        // Adapt alpha: smoothly scale up to 0.55 at 32 kbps to leverage perceptual NMR masking
+        double factor = (128.0 - static_cast<double>(s.mpeg.bitr)) / (128.0 - 32.0);
+        factor = std::clamp(factor, 0.0, 1.0);
+        alpha = alpha + factor * (0.55 - alpha);
+
+        // Adapt strict_db: scale down strictness to prevent starving mid/high frequencies
+        double strict_factor = (static_cast<double>(s.mpeg.bitr) - 32.0) / (128.0 - 32.0);
+        strict_factor = std::clamp(strict_factor, 0.25, 1.0);
+        strict_db *= strict_factor;
+    }
+
+    p.alpha = std::clamp(alpha, 0.0, 1.0);
+    p.lf_strict_db        = std::max(0.0, strict_db);
     p.lf_strict_cutoff_hz = s.cfg_lf_strict_cutoff_hz;
+    p.waveform_reg        = s.cfg_waveform_reg;
     return p;
 }
 
@@ -336,21 +352,130 @@ void compute_masking_thresholds(const EncoderState& s, int ch, int gr,
         }
     }
 
-    // 6. Time axis — pre-masking penalty for transient/attack-from-silence.
-    //    When the granule contains a sub-window of silence preceding an
-    //    attack, the band-average threshold overestimates how much masking
-    //    actually exists at the silent portion of the granule. Multiply
-    //    down so the encoder spends more bits there.
-    double pre_mask_mul = 1.0;
-    if (gr >= 0 && gr < MAX_GRANULES) {
-        if (s.attack_from_silence_flags[gr])
-            pre_mask_mul = params.pre_mask_attack_from_silence;
-        else if (s.transient_flags[gr] || s.pre_window_flags[gr])
-            pre_mask_mul = params.pre_mask_transient;
+    // 5b. Overtone (harmonic) masking adjustment.
+    //     If the signal contains a strong fundamental component, its harmonics are
+    //     subject to additional masking. We detect the fundamental component and
+    //     boost the masking thresholds at its harmonics (2nd to 8th).
+    int fund_bin = -1;
+    double max_val = 0.0;
+    // Scan bins 4 to 120 (roughly 150 Hz to 4.5 kHz at 44.1k)
+    for (int i = 4; i < 120; ++i) {
+        if (mag[i] > max_val) {
+            max_val = mag[i];
+            fund_bin = i;
+        }
     }
-    if (pre_mask_mul < 1.0) {
+
+    if (fund_bin >= 0 && max_val > 1000.0) {
+        auto sfb_containing = [&](int bin) {
+            for (int sfb = 0; sfb < NUM_SFB_LONG_; ++sfb) {
+                if (bin >= band_table[sfb] && bin < band_table[sfb + 1]) {
+                    return sfb;
+                }
+            }
+            return -1;
+        };
+
+        for (int k = 2; k <= 8; ++k) {
+            int harm_bin = k * fund_bin;
+            if (harm_bin >= GRANULE_SAMPLES) break;
+            int sfb = sfb_containing(harm_bin);
+            if (sfb >= 0) {
+                // Harmonically related bands are easier to mask: boost thresholds.
+                const double boost = (k == 2) ? 1.8 : 1.4;
+                thr[sfb] *= boost;
+                if (sfb > 0) thr[sfb - 1] *= 1.15;
+                if (sfb + 1 < NUM_SFB_LONG_) thr[sfb + 1] *= 1.15;
+            }
+        }
+    }
+
+    // 6. Time axis — pre-masking penalty for transient / pre-window.
+    //
+    //    The long MDCT window (576 samples ≈ 13 ms) spreads a transient's
+    //    energy across the entire granule. In the quiet region *before* the
+    //    attack the band-average threshold overestimates masking because the
+    //    actual masker (the transient) has not arrived yet. Pre-echo is the
+    //    quantisation noise that leaks into this unmasked region.
+    //
+    //    New: (a) SFB-dependent penalty — higher SFBs carry a larger
+    //    multiplier because the ear's temporal resolution is finer at HF
+    //    and HF lacks the musical-content masking that protects the bass.
+    //    (b) Energy-contrast scaling — sharper attacks (higher contrast
+    //    between the attack sub-window and the preceding one) produce more
+    //    audible pre-echo, so the penalty is graded by contrast^exponent.
+    //    (c) Cross-frame retroactive penalty — when the current frame's
+    //    gr=0 is a transient but the previous frame's last granule was not,
+    //    we inject a synthetic low threshold into the masking history so
+    //    the post-mask carry pushes a stricter floor into the current frame.
+    //
+    //    The base pre_mask_mul values (0.02 for attack-from-silence, 0.25
+    //    for ordinary transient) are defined in MaskingParams; the per-band
+    //    modulation is applied on top.
+
+    // --- 6a. Cross-frame pre_window history injection ---
+    //    If cross_frame_pre_window is set, the previous frame's last granule
+    //    *should* have been treated as a pre_window but was already encoded.
+    //    Inject a low threshold into the history so the post-mask decay
+    //    (step 5 above) pulls the current frame's gr=0 thresholds down.
+    //    Only applies to the first (gr, ch) pair processed (gr=0).
+    if (gr == 0 && s.cross_frame_pre_window && history.has_prev) {
+        // Scale down history thresholds as if the previous granule's
+        // masking was reduced by the pre_mask_transient factor, graded
+        // by the cross-frame energy contrast.
+        const double base_mul = params.pre_mask_transient;
+        const double contrast_scale =
+            (params.pre_echo_contrast_exponent > 0.0 && s.cross_frame_energy_contrast > 1.0)
+                ? std::pow(s.cross_frame_energy_contrast, params.pre_echo_contrast_exponent)
+                : 1.0;
         for (int b = 0; b < NUM_SFB_LONG_; ++b) {
-            thr[b] *= pre_mask_mul;
+            double hf_mul = params.pre_echo_hf_penalty_lo;
+            if (b >= 17)     hf_mul = params.pre_echo_hf_penalty_hi;
+            else if (b >= 11) hf_mul = params.pre_echo_hf_penalty_mid;
+
+            const double mul = base_mul / std::max(hf_mul * contrast_scale, 1.0);
+            history.prev_thr[b] *= std::clamp(mul, 0.001, 1.0);
+        }
+    }
+
+    // --- 6b. Intra-frame pre-masking penalty ---
+    if (gr >= 0 && gr < MAX_GRANULES) {
+        double base_mul = 1.0;
+        double contrast = 1.0;
+        bool apply_penalty = false;
+
+        if (s.attack_from_silence_flags[gr]) {
+            base_mul = params.pre_mask_attack_from_silence;
+            contrast = s.energy_contrast[gr];
+            apply_penalty = true;
+        } else if (s.transient_flags[gr] || s.pre_window_flags[gr]) {
+            base_mul = params.pre_mask_transient;
+            contrast = s.energy_contrast[gr];
+            // For pre_window granules, use the contrast of the *next*
+            // granule's attack (the one we're shielding against).
+            if (s.pre_window_flags[gr] && !s.transient_flags[gr]
+                && gr + 1 < MAX_GRANULES)
+                contrast = s.energy_contrast[gr + 1];
+            apply_penalty = true;
+        }
+
+        if (apply_penalty) {
+            // Contrast scaling: sharper attacks → more audible pre-echo.
+            const double contrast_scale =
+                (params.pre_echo_contrast_exponent > 0.0 && contrast > 1.0)
+                    ? std::pow(contrast, params.pre_echo_contrast_exponent)
+                    : 1.0;
+
+            for (int b = 0; b < NUM_SFB_LONG_; ++b) {
+                // SFB-dependent penalty multiplier.
+                double hf_mul = params.pre_echo_hf_penalty_lo;
+                if (b >= 17)     hf_mul = params.pre_echo_hf_penalty_hi;
+                else if (b >= 11) hf_mul = params.pre_echo_hf_penalty_mid;
+
+                // Combined per-band pre-mask factor: lower = stricter.
+                const double mul = base_mul / std::max(hf_mul * contrast_scale, 1.0);
+                thr[b] *= std::clamp(mul, 0.001, 1.0);
+            }
         }
     }
 

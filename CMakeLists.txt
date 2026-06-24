@@ -27,9 +27,12 @@ else()
 endif()
 
 add_library(rmps_optflags INTERFACE)
-if(NOT MSVC)
+if(MSVC)
     target_compile_options(rmps_optflags INTERFACE
-        $<$<CONFIG:Release>:-O3 -ffast-math -fno-math-errno -funroll-loops>)
+        $<$<CONFIG:Release>:/O2 /Oi /Ot /Oy /GT /fp:fast>)
+else()
+    target_compile_options(rmps_optflags INTERFACE
+        $<$<CONFIG:Release>:-O3 -ffast-math -fno-math-errno -funroll-loops -march=native>)
 endif()
 
 # ----- core library -----
@@ -45,6 +48,7 @@ add_library(rmps STATIC
     src/quant/quantize.cpp
     src/quant/iteration_loop.cpp
     src/quant/beam_search.cpp
+    src/quant/short_block.cpp
     src/quant/hf_rdo.cpp
     src/post/perceptual.cpp
     src/post/ms_stereo.cpp
@@ -69,6 +73,17 @@ add_executable(rmps_cli
 )
 set_target_properties(rmps_cli PROPERTIES OUTPUT_NAME rmps)
 target_link_libraries(rmps_cli PRIVATE rmps rmps_warnings rmps_optflags)
+if(WIN32 AND NOT MSVC)
+    target_link_options(rmps_cli PRIVATE -static)
+endif()
+
+# ----- Link-Time Optimization (LTO) / Interprocedural Optimization (IPO) -----
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ipo_supported LANGUAGES CXX)
+if(ipo_supported)
+    set_target_properties(rmps PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+    set_target_properties(rmps_cli PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
 
 # ----- install -----
 include(GNUInstallDirs)

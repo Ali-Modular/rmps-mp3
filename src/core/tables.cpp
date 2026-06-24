@@ -1,4 +1,5 @@
 #include "core/tables.hpp"
+#include <cmath>
 
 namespace rmps::tables {
 
@@ -64,6 +65,30 @@ const std::array<std::array<int, NUM_SCFB_LONG>, NUM_SAMPLERATES>
         //  8000
         {{0,   12,  24,  36,  48,  60,  72,  88,  108, 132, 160, 192,
           232, 280, 336, 400, 476, 566, 568, 570, 572, 574, 576}},
+    }};
+
+// Short-block scalefactor band boundaries (per-window line index, 0..192),
+// 13 bands + terminator. Values from the ISO/LAME sfBandIndex[].s tables.
+const std::array<std::array<int, NUM_SCFB_SHORT>, NUM_SAMPLERATES>
+    scale_fact_band_index_short = {{
+        // 44100
+        {{0, 4, 8, 12, 16, 22, 30, 40, 52, 66, 84, 106, 136, 192}},
+        // 48000
+        {{0, 4, 8, 12, 16, 22, 28, 38, 50, 64, 80, 100, 126, 192}},
+        // 32000
+        {{0, 4, 8, 12, 16, 22, 30, 42, 58, 78, 104, 138, 180, 192}},
+        // 22050
+        {{0, 4, 8, 12, 18, 24, 32, 42, 56, 74, 100, 132, 174, 192}},
+        // 24000
+        {{0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 136, 180, 192}},
+        // 16000
+        {{0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174, 192}},
+        // 11025
+        {{0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174, 192}},
+        // 12000
+        {{0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174, 192}},
+        //  8000
+        {{0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166, 192}},
     }};
 
 const std::array<std::uint8_t, 22> pretab = {
@@ -149,5 +174,21 @@ const std::array<std::int32_t, NUM_ENWINDOW> enwindow = {{
     2147,      2147,      0,         0,         0,         0,         0,
     0,
 }};
+
+const std::array<double, 8192> pow43_tab = []() {
+    std::array<double, 8192> t{};
+    for (std::size_t i = 0; i < 8192; ++i) {
+        t[i] = std::pow(static_cast<double>(i), 4.0 / 3.0);
+    }
+    return t;
+}();
+
+const std::array<double, 13> pow2_half_tab = []() {
+    std::array<double, 13> t{};
+    for (std::size_t i = 0; i < 13; ++i) {
+        t[i] = std::pow(2.0, 0.5 * static_cast<double>(i));
+    }
+    return t;
+}();
 
 } // namespace rmps::tables

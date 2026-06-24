@@ -5,6 +5,7 @@
 #include "core/tables.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 
 namespace rmps::quant {
@@ -22,14 +23,14 @@ constexpr std::array<std::pair<int, int>, 23> SUBDV_TABLE = {{
 } // namespace
 
 void initialise(EncoderState& s) {
-    for (int i = 0; i < 128; ++i) {
+    for (int i = 0; i < 256; ++i) {
         s.steptab[i] = std::pow(2.0, (127.0 - i) / 4.0);
         const double v = s.steptab[i] * 2.0;
         s.steptabi[i] = (v > 0x7fffffff)
             ? 0x7fffffff
-            : static_cast<std::int32_t>(v + 0.5);
+            : (v < 0.5 ? 0 : static_cast<std::int32_t>(v + 0.5));
     }
-    for (int i = 0; i < 10000; ++i) {
+    for (int i = 0; i < 262144; ++i) {
         s.int2idx[i] = static_cast<int>(std::pow(static_cast<double>(i), 0.75) - 0.0946 + 0.5);
     }
 }
@@ -39,15 +40,14 @@ int quantize(int* ix, int stepsize, EncoderState& s) {
     if (fx::mulr(s.xrmax, scalei) > 165140) return 16384;
 
     int max_val = 0;
-    const double step = s.steptab[stepsize + 127];
     for (int i = 0; i < GRANULE_SAMPLES; ++i) {
         const std::int32_t x = s.xrabs[i];
         const std::int32_t ln = fx::mulr(x, scalei);
         int v;
-        if (ln < 10000) v = s.int2idx[ln];
-        else {
-            const double dbl = static_cast<double>(x) * step * 4.656612875e-10;
-            v = static_cast<int>(std::pow(std::max(dbl, 0.0), 0.75));
+        if (ln < 262144) {
+            v = s.int2idx[static_cast<std::size_t>(ln)];
+        } else {
+            v = 8191;
         }
         ix[i] = v;
         if (v > max_val) max_val = v;
@@ -72,6 +72,9 @@ void calc_runlen(int* ix, GrInfo& gi) {
 }
 
 int count1_bitcount(int* ix, GrInfo& gi) {
+    static constexpr std::array<int, 16> POPCOUNT_16 = {
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4
+    };
     int sum0 = 0, sum1 = 0;
     const int start_idx = gi.big_values << 1;
     const auto* h32 = huffman::at(32).hlen;
@@ -80,11 +83,7 @@ int count1_bitcount(int* ix, GrInfo& gi) {
         const int i = start_idx + k * 4;
         const int v = ix[i], w = ix[i+1], x = ix[i+2], y = ix[i+3];
         const int p = v + (w << 1) + (x << 2) + (y << 3);
-        int signbits = 0;
-        if (v) ++signbits;
-        if (w) ++signbits;
-        if (x) ++signbits;
-        if (y) ++signbits;
+        const int signbits = POPCOUNT_16[p];
         sum0 += signbits + h32[p];
         sum1 += signbits + h33[p];
     }
@@ -226,6 +225,187 @@ void bigv_tab_select(int* ix, GrInfo& gi) {
         gi.table_select[2] = new_choose_table(ix, gi.address2, gi.big_values << 1);
 }
 
+int best_subdivide_rd(int* ix, GrInfo& gi, EncoderState& s) {
+    const int bigv = gi.big_values << 1;
+    if (bigv <= 0) {
+        gi.region0_count = 0;
+        gi.region1_count = 0;
+        gi.address1 = 0;
+        gi.address2 = 0;
+        gi.address3 = 0;
+        gi.table_select = {0, 0, 0};
+        return 0;
+    }
+
+    const auto& sfb = tables::scale_fact_band_index[s.mpeg.samplerate_index];
+
+    // ---- Prefix tables over coefficient pairs ----------------------------
+    // SFB boundaries and 2*big_values are always even, so every realisable
+    // region edge falls on a pair boundary. One O(n_pairs) pass builds
+    // everything the 128-combination region search needs in O(1) per segment.
+    //
+    //   SMALL_T   non-ESC tables and the max value they can encode
+    //   pb_s[t]   prefix bits (incl. sign bits) for each small table
+    //   pb16/24   prefix bits with ESC values clamped to 15 (family base)
+    //   pesc      prefix count of escape values (>14) — linbits multiplier
+    //   pmax      prefix max of |ix|
+    static constexpr int SMALL_T[]    = {1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15};
+    static constexpr int NUM_SMALL    = 13;
+
+    const int n_pairs = bigv >> 1;
+    auto& pb_s = s.subdivide_scratch.pb_s;
+    auto& pb16 = s.subdivide_scratch.pb16;
+    auto& pb24 = s.subdivide_scratch.pb24;
+    auto& pesc = s.subdivide_scratch.pesc;
+    auto& pmax = s.subdivide_scratch.pmax;
+
+
+    const std::uint16_t* hl16 = huffman::at(16).hlen;
+    const std::uint16_t* hl24 = huffman::at(24).hlen;
+    const std::uint16_t* hl_s[NUM_SMALL];
+    int xlen_s[NUM_SMALL];
+    for (int k = 0; k < NUM_SMALL; ++k) {
+        const auto& h = huffman::at(SMALL_T[k]);
+        hl_s[k]   = h.hlen;
+        xlen_s[k] = h.xlen;
+    }
+
+    pmax[0] = 0; pesc[0] = 0; pb16[0] = 0; pb24[0] = 0;
+    for (int k = 0; k < NUM_SMALL; ++k) pb_s[k][0] = 0;
+
+    static constexpr std::array<int, 16> START_K = {
+        0, 0, 1, 3, 5, 5, 8, 8, 11, 11, 11, 11, 11, 11, 11, 11
+    };
+
+    const std::uint32_t const_hl16_0 = hl16[0];
+    const std::uint32_t const_hl24_0 = hl24[0];
+    std::array<std::uint32_t, NUM_SMALL> const_hl_s_0{};
+    for (int k = 0; k < NUM_SMALL; ++k) {
+        const_hl_s_0[k] = hl_s[k][0];
+    }
+
+    for (int p = 0; p < n_pairs; ++p) {
+        const int x = ix[2 * p], y = ix[2 * p + 1];
+        if (x == 0 && y == 0) {
+            pmax[p + 1] = pmax[p];
+            pesc[p + 1] = pesc[p];
+            pb16[p + 1] = pb16[p] + const_hl16_0;
+            pb24[p + 1] = pb24[p] + const_hl24_0;
+            for (int k = 0; k < NUM_SMALL; ++k) {
+                pb_s[k][p + 1] = pb_s[k][p] + const_hl_s_0[k];
+            }
+            continue;
+        }
+        const int sign = (x ? 1 : 0) + (y ? 1 : 0);
+        const int m    = (x > y) ? x : y;
+        pmax[p + 1] = static_cast<std::uint16_t>((m > pmax[p]) ? m : pmax[p]);
+        pesc[p + 1] = static_cast<std::uint16_t>(pesc[p] + (x > 14) + (y > 14));
+        const int cx = (x > 14) ? 15 : x;
+        const int cy = (y > 14) ? 15 : y;
+        const int eidx = cx * 16 + cy;
+        pb16[p + 1] = pb16[p] + static_cast<std::uint32_t>(hl16[eidx] + sign);
+        pb24[p + 1] = pb24[p] + static_cast<std::uint32_t>(hl24[eidx] + sign);
+        
+        const int start_k = (m < 16) ? START_K[static_cast<std::size_t>(m)] : 13;
+        for (int k = 0; k < start_k; ++k) {
+            pb_s[k][p + 1] = pb_s[k][p] + 0x40000u;
+        }
+        for (int k = start_k; k < NUM_SMALL; ++k) {
+            const int xl = xlen_s[k];
+            pb_s[k][p + 1] = pb_s[k][p] + static_cast<std::uint32_t>(hl_s[k][x * xl + y] + sign);
+        }
+    }
+
+    // Best (table, bits) for the pair range [a, b).
+    struct Seg { int table; int bits; };
+    auto seg_best = [&](int a, int b) -> Seg {
+        if (b <= a) return {0, 0};
+        // pmax is a running prefix max: if it grew inside [a,b) the segment
+        // max equals pmax[b]; otherwise the true max sits before `a` and a
+        // short scan recovers the segment-local value exactly.
+        int seg_max = (pmax[b] > pmax[a]) ? pmax[b] : 0;
+        if (seg_max == 0) {
+            // Running max did not grow: scan (rare, short segments only when
+            // the largest values sit before `a`).
+            for (int p = a; p < b; ++p) {
+                const int x = ix[2 * p], y = ix[2 * p + 1];
+                if (x > seg_max) seg_max = x;
+                if (y > seg_max) seg_max = y;
+            }
+        }
+        if (seg_max == 0) return {0, 0};
+        if (seg_max < 15) {
+            int best_t = 0, best_b = INT_MAX;
+            for (int k = 0; k < NUM_SMALL; ++k) {
+                if (xlen_s[k] <= seg_max) continue;
+                const int b_ = static_cast<int>(pb_s[k][b] - pb_s[k][a]);
+                if (b_ < best_b) { best_b = b_; best_t = SMALL_T[k]; }
+            }
+            if (best_b < 0x40000) return {best_t, best_b};
+            // (unreachable: tables 13/15 cover every value < 15)
+        }
+        // ESC path.
+        const int esc = pesc[b] - pesc[a];
+        const int lin_need = (seg_max > 15) ? seg_max - 15 : 0;
+        int t1;
+        if (lin_need <= 1)         t1 = 16;
+        else if (lin_need <= 3)    t1 = 17;
+        else if (lin_need <= 7)    t1 = 18;
+        else if (lin_need <= 15)   t1 = 19;
+        else if (lin_need <= 63)   t1 = 20;
+        else if (lin_need <= 255)  t1 = 21;
+        else if (lin_need <= 1023) t1 = 22;
+        else                       t1 = 23;
+        const int t2 = t1 + 8;
+        const int b1 = static_cast<int>(pb16[b] - pb16[a]) + esc * huffman::at(t1).linbits;
+        const int b2 = static_cast<int>(pb24[b] - pb24[a]) + esc * huffman::at(t2).linbits;
+        return (b2 < b1) ? Seg{t2, b2} : Seg{t1, b1};
+    };
+
+    // ---- Exhaustive (region0_count, region1_count) search ----------------
+    constexpr int NUM_EDGES = 23;
+    int bnd[NUM_EDGES];
+    for (int k = 0; k < NUM_EDGES; ++k) {
+        const int v = sfb[k];
+        bnd[k] = ((v < bigv) ? v : bigv) >> 1;   // pair index, clamped
+    }
+
+    Seg r0_seg[17];
+    for (int i1 = 1; i1 <= 16; ++i1) r0_seg[i1] = seg_best(0, bnd[i1]);
+    // region-2 best for every possible i2 (start edge index)
+    Seg r2_seg[NUM_EDGES];
+    for (int i2 = 2; i2 < NUM_EDGES; ++i2) r2_seg[i2] = seg_best(bnd[i2], n_pairs);
+
+    int best_bits = INT_MAX, best_r0 = 0, best_r1 = 0;
+    for (int r0 = 0; r0 < 16; ++r0) {
+        const int i1 = r0 + 1;
+        const int b0 = r0_seg[i1].bits;
+        for (int r1 = 0; r1 < 8; ++r1) {
+            const int i2 = i1 + r1 + 1;
+            if (i2 >= NUM_EDGES) break;
+            int bits = b0 + r2_seg[i2].bits;
+            if (bnd[i2] > bnd[i1]) {
+                bits += seg_best(bnd[i1], bnd[i2]).bits;
+            }
+            if (bits < best_bits) { best_bits = bits; best_r0 = r0; best_r1 = r1; }
+        }
+        if (bnd[i1] >= n_pairs) break;   // region 0 already swallows everything
+    }
+
+    const int i1 = best_r0 + 1;
+    const int i2 = best_r0 + best_r1 + 2;
+    gi.region0_count = best_r0;
+    gi.region1_count = best_r1;
+    gi.address1      = bnd[i1] << 1;
+    gi.address2      = bnd[i2] << 1;
+    gi.address3      = bigv;
+    gi.table_select  = {0, 0, 0};
+    if (gi.address1 > 0)           gi.table_select[0] = r0_seg[i1].table;
+    if (gi.address2 > gi.address1) gi.table_select[1] = seg_best(bnd[i1], bnd[i2]).table;
+    if (bigv > gi.address2)        gi.table_select[2] = r2_seg[i2].table;
+    return (best_bits == INT_MAX) ? 0 : best_bits;
+}
+
 int bin_search_StepSize(int desired_rate, int* ix, GrInfo& gi, EncoderState& s) {
     int next_val = -120, count = 120;
     while (count > 1) {
@@ -251,7 +431,22 @@ int inner_loop(int* ix, int max_bits, GrInfo& gi, EncoderState& s) {
     int bits = 0;
     while (true) {
         gi.quantizerStepSize += 1;
-        while (quantize(ix, gi.quantizerStepSize, s) > 8192) gi.quantizerStepSize += 1;
+        if (gi.quantizerStepSize > 128) {
+            gi.quantizerStepSize = 128;
+            std::fill_n(ix, GRANULE_SAMPLES, 0);
+            bits = 0;
+            break;
+        }
+        while (quantize(ix, gi.quantizerStepSize, s) > 8192) {
+            gi.quantizerStepSize += 1;
+            if (gi.quantizerStepSize > 128) break;
+        }
+        if (gi.quantizerStepSize > 128) {
+            gi.quantizerStepSize = 128;
+            std::fill_n(ix, GRANULE_SAMPLES, 0);
+            bits = 0;
+            break;
+        }
         calc_runlen(ix, gi);
         bits  = count1_bitcount(ix, gi);
         subdivide(gi, s);
@@ -280,8 +475,14 @@ int outer_loop(int max_bits, int* ix, int gr, int ch, EncoderState& s) {
     gi.quantizerStepSize = bin_search_StepSize(max_bits, ix, gi, s);
     gi.part2_length      = part2_length(gr, ch, s);
     const int huff_bits  = max_bits - gi.part2_length;
-    const int bits       = inner_loop(ix, huff_bits, gi, s);
-    gi.part2_3_length    = gi.part2_length + bits;
+    (void)inner_loop(ix, huff_bits, gi, s);
+    // Finalise with the RD-optimal region split. This recount also repairs
+    // the run-length fields in the all-zero starvation path (inner_loop can
+    // zero ix while gi still carries counts from a previous iteration).
+    calc_runlen(ix, gi);
+    int bits  = count1_bitcount(ix, gi);
+    bits     += best_subdivide_rd(ix, gi, s);
+    gi.part2_3_length = gi.part2_length + bits;
     return gi.part2_3_length;
 }
 

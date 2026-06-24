@@ -99,9 +99,19 @@ struct EncoderState {
   int ResvMax = 0;
 
   // ----- loop tables (initialised once) -----
-  std::array<double, 128> steptab{};
-  std::array<std::int32_t, 128> steptabi{};
-  std::array<int, 10000> int2idx{};
+  std::array<double, 256> steptab{};
+  std::array<std::int32_t, 256> steptabi{};
+  std::array<int, 262144> int2idx{};
+
+  // ----- scratch buffers for best_subdivide_rd -----
+  struct SubdivideScratch {
+    std::array<std::array<std::uint32_t, 289>, 13> pb_s;
+    std::array<std::uint32_t, 289> pb16;
+    std::array<std::uint32_t, 289> pb24;
+    std::array<std::uint16_t, 289> pesc;
+    std::array<std::uint16_t, 289> pmax;
+  } subdivide_scratch{};
+
 
   // ----- subband state -----
   std::array<int, MAX_CHANNELS> subband_off{0, 0};
@@ -110,6 +120,17 @@ struct EncoderState {
 
   // ----- MDCT tables -----
   std::array<std::array<std::int32_t, 36>, K_PER_GRANULE> mdct_cos_l{};
+  // Window-folded 36-point bases for the start (long->short) and stop
+  // (short->long) transition blocks. Same layout/semantics as mdct_cos_l
+  // (Q31, [output 0..17][input 0..35]); only the window shape differs.
+  std::array<std::array<std::int32_t, 36>, K_PER_GRANULE> mdct_cos_start{};
+  std::array<std::array<std::int32_t, 36>, K_PER_GRANULE> mdct_cos_stop{};
+  // Window-folded 12-point short MDCT basis: [output 0..5][input 0..11], Q31.
+  // Applied independently to each of the 3 short sub-windows of a subband.
+  std::array<std::array<std::int32_t, 12>, 6> mdct_cos_s{};
+  // Short-block reorder: transmission index (0..575) -> natural position
+  // (sb*18 + w*6 + k) produced by the per-subband short MDCT. Built at init.
+  std::array<int, GRANULE_SAMPLES> short_reorder{};
 
   // ----- per-iteration scratch (refreshed per granule) -----
   const std::int32_t *xr = nullptr;
@@ -131,6 +152,39 @@ struct EncoderState {
   std::array<bool,   MAX_GRANULES> pre_window_flags    {false, false};
   std::array<bool,   MAX_GRANULES> attack_from_silence_flags {false, false};
   std::array<bool,   MAX_GRANULES> silent_flags              {false, false};
+  /// Per-granule: attack carries significant HF content (worth a short block).
+  /// Low-frequency transients (kicks) stay long to preserve bass resolution.
+  std::array<bool,   MAX_GRANULES> hf_transient_flags        {false, false};
+
+  // ----- Per-(ch, gr) block type (window switching) -----
+  /// Decided per frame by control::decide_block_types before MDCT, consumed by
+  /// mdct::analyse (window choice) and iteration_loop (quantizer choice).
+  std::array<std::array<int, MAX_GRANULES>, MAX_CHANNELS> block_type {};
+  /// Last granule's block type per channel, carried across frames so the
+  /// start/stop transition state machine stays continuous.
+  std::array<int, MAX_CHANNELS> prev_block_type {BLOCK_LONG, BLOCK_LONG};
+  /// Master enable for window switching (Config::block_switching). When false
+  /// every granule stays BLOCK_LONG and the encoder is bit-identical to before.
+  bool cfg_block_switching = true;
+
+  // ----- Sub-window energy profile (from TransientGate) -----
+  /// Per-granule sub-window energies (3 × 192-sample windows per granule).
+  /// Used by the masking model to estimate pre-echo exposure.
+  std::array<std::array<double, 3>, MAX_GRANULES> sub_window_energies{};
+  /// Sub-window index (0–2) where the attack fires, or -1 for no attack.
+  std::array<int,    MAX_GRANULES> attack_sub_index{-1, -1};
+  /// Energy contrast ratio (attack / preceding sub-window).
+  std::array<double, MAX_GRANULES> energy_contrast{1.0, 1.0};
+
+  /// When the current frame's gr=0 is a transient, the previous frame's
+  /// last granule should be treated as a pre_window (but was already
+  /// encoded). This flag tells the masking model to inject an artificial
+  /// low threshold into the history so the post-mask carry bleeds into
+  /// the current frame's thresholds — an approximate retroactive fix.
+  bool cross_frame_pre_window = false;
+  /// Energy contrast of the cross-frame boundary (current gr=0 attack
+  /// vs previous frame's last sub-window).
+  double cross_frame_energy_contrast = 1.0;
 
   // ----- 3D masking model -----
   /// Per-(ch, gr) masking thresholds, recomputed by iteration_loop after
@@ -157,6 +211,22 @@ struct EncoderState {
   /// Multiplier on the perceptual weight for HF SFBs (17–20). > 1
   /// forces the cost function to spend more bits on hi-hat sizzle.
   double hf_weight_boost = 1.0;
+  /// 1st-order error-feedback noise-shaping coefficient used by the
+  /// per-band shaping quantizer (0..0.95). 0 = no shaping. Sourced from
+  /// Config::noise_shaping_alpha (CLI --shaping); default 0.5.
+  double cfg_noise_shaping_alpha = 0.5;
+  /// Waveform preservation regularization strength (0..1.0).
+  double cfg_waveform_reg = 0.05;
+
+  /// Adaptive joint-stereo: when true, the encoder decides per frame whether
+  /// M/S coding actually compresses better than plain L/R and switches
+  /// mode_ext accordingly (2 = MS on, 0 = MS off). Always-on MS wastes bits
+  /// on weakly/anti-correlated material where E[S] ≈ E[M].
+  bool cfg_adaptive_ms = true;
+  /// Previous frame's MS decision (hysteresis anchor to stop flip-flopping
+  /// at the decision boundary, which would otherwise modulate the stereo
+  /// image frame-to-frame).
+  bool ms_prev_frame = true;
 
   /// Snapshot of the last successfully-encoded granule per channel,
   /// used by the outer_loop fallback path to inherit SFs / compress /

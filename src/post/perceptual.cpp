@@ -10,8 +10,8 @@ namespace rmps::post {
 
 namespace {
 
-constexpr double MS_IMAGE_FACTOR = 0.60;   // 500..3 kHz preserved
-constexpr double MS_OUTER_FACTOR = 0.30;   // outside that band
+constexpr double MS_IMAGE_FACTOR = 0.70;   // 500..3 kHz preserved (was 0.60)
+constexpr double MS_OUTER_FACTOR = 0.45;   // outside that band (was 0.30)
 
 double a_weight_db(double f) {
     if (f < 10.0) return -50.0;

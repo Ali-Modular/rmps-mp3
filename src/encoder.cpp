@@ -38,6 +38,24 @@ int find_bitrate_index(int kbps, int version) {
     return -1;
 }
 
+int find_nearest_bitrate_index(int kbps, int version, int& snapped) {
+    int best_idx = 1;
+    int best_diff = 1000000;
+    int best_kbps = 0;
+    for (int i = 1; i < tables::NUM_BITRATES - 1; ++i) {
+        const int b = tables::bitrates[i][version];
+        if (b < 0) continue;
+        const int diff = std::abs(kbps - b);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_idx  = i;
+            best_kbps = b;
+        }
+    }
+    snapped = best_kbps;
+    return best_idx;
+}
+
 int granules_per_frame_for(int version) {
     return version == 3 ? 2 : 1;
 }
@@ -58,12 +76,20 @@ struct Encoder::Impl {
         const int sr_idx = find_samplerate_index(c.samplerate);
         if (sr_idx < 0) return false;
         const int ver    = mpeg_version_for(sr_idx);
-        const int br_idx = find_bitrate_index(initial_kbps, ver);
+        
+        int snapped_kbps = 0;
+        int br_idx = -1;
+        if (c.abr_target_kbps) {
+            br_idx = find_nearest_bitrate_index(initial_kbps, ver, snapped_kbps);
+        } else {
+            br_idx = find_bitrate_index(initial_kbps, ver);
+            snapped_kbps = initial_kbps;
+        }
         if (br_idx < 0) return false;
 
         state.wave.channels   = c.channels;
         state.wave.samplerate = c.samplerate;
-        state.mpeg.bitr       = initial_kbps;
+        state.mpeg.bitr       = snapped_kbps;
         state.mpeg.emph       = c.emph;
         state.mpeg.copyright  = c.copyright;
         state.mpeg.original   = c.original;
@@ -108,6 +134,13 @@ struct Encoder::Impl {
         state.cfg_lf_strict_cutoff_hz = c.lf_strict_cutoff_hz;
         state.pre_gain          = std::pow(10.0, c.pre_gain_db / 20.0);
         state.hf_weight_boost   = std::max(1.0, c.hf_weight_boost);
+        state.cfg_noise_shaping_alpha = std::clamp(c.noise_shaping_alpha, 0.0, 0.95);
+        state.cfg_waveform_reg  = c.waveform_reg;
+        state.cfg_adaptive_ms   = c.adaptive_joint_stereo;
+        state.ms_prev_frame     = true;
+        state.cfg_block_switching = c.block_switching;
+        state.prev_block_type   = {BLOCK_LONG, BLOCK_LONG};
+        state.transient_gate.set_hf_transient_threshold(c.short_block_hf_threshold);
 
         // The bit reservoir is now realised by the cross-frame main_data_begin
         // mechanism in l3_bitstream + the frame_pool seed in iteration_loop
@@ -128,6 +161,9 @@ struct Encoder::Impl {
             control::AbrController::Options o;
             o.target_kbps = *c.abr_target_kbps;
             if (c.target_sdr_db) o.target_sdr_db = c.target_sdr_db;
+            if (c.abr_kp) o.kp = *c.abr_kp;
+            if (c.abr_ki) o.ki = *c.abr_ki;
+            if (c.abr_kd) o.kd = *c.abr_kd;
             o.min_kbps = c.abr_min_kbps;
             o.max_kbps = c.abr_max_kbps;
             o.mpeg_version = ver;
@@ -174,7 +210,11 @@ struct Encoder::Impl {
                 state.pre_window_flags[gr]   = d.pre_window;
                 state.attack_from_silence_flags[gr] = d.attack_from_silence;
                 state.silent_flags[gr]       = d.silent;
+                state.hf_transient_flags[gr] = d.hf_transient;
                 state.transient_cutoff_hz[gr] = d.cutoff_hz;
+                state.sub_window_energies[gr] = d.sub_energies;
+                state.attack_sub_index[gr]    = d.attack_sub_index;
+                state.energy_contrast[gr]     = d.energy_contrast;
                 if (d.transient) {
                     ++state.frame_transient_granules;
                     any_transient = true;
@@ -189,6 +229,17 @@ struct Encoder::Impl {
                 for (int ch = 0; ch < state.wave.channels; ++ch)
                     state.pe[ch][gr] = 0.0;
             }
+            // Cross-frame pre_window: if gr=0 of the current frame is a
+            // transient, the last granule of the *previous* frame was the
+            // pre-echo zone. We can't re-encode it, but we inject a
+            // synthetic low threshold into the masking history so the
+            // post-mask decay carries a stricter threshold into gr=0.
+            state.cross_frame_pre_window =
+                state.transient_flags[0]
+                && !state.transient_gate.prev_frame_last_decision().transient;
+            state.cross_frame_energy_contrast =
+                state.cross_frame_pre_window
+                    ? state.energy_contrast[0] : 1.0;
         }
 
         // 2. ABR picks the bitrate, biased by the transient hint.
@@ -197,6 +248,10 @@ struct Encoder::Impl {
             control::switch_bitrate(state, abr->next_target_kbps());
         }
         recompute_frame_timing();
+
+        // 3. Decide per-(ch, gr) block types from the transient flags before
+        //    MDCT, so analyse() can pick the matching analysis window.
+        control::decide_block_types(state);
 
         mdct::analyse(state, stride);
         quant::iteration_loop(state);
@@ -227,6 +282,13 @@ struct Encoder::Impl {
         if (state.hf_adaptor) last_stats.hf = state.hf_adaptor->state();
         last_stats.transient_granules  = state.frame_transient_granules;
         last_stats.transient_cutoff_hz = state.frame_min_transient_cutoff_hz;
+        for (int gr = 0; gr < state.mpeg.granules_per_frame; ++gr)
+            for (int ch = 0; ch < state.wave.channels; ++ch) {
+                const int bt = state.block_type[ch][gr];
+                if (bt == BLOCK_SHORT) ++last_stats.short_block_granules;
+                else if (bt == BLOCK_START || bt == BLOCK_STOP)
+                    ++last_stats.transition_block_granules;
+            }
         last_stats.attack_from_silence_granules = 0;
         for (int gr = 0; gr < state.mpeg.granules_per_frame; ++gr)
             if (state.attack_from_silence_flags[gr])
@@ -296,6 +358,9 @@ void Encoder::set_target_kbps(int kbps) {
         auto o = control::AbrController::Options{};
         o.target_kbps   = kbps;
         o.target_sdr_db = impl_->cfg.target_sdr_db;
+        if (impl_->cfg.abr_kp) o.kp = *impl_->cfg.abr_kp;
+        if (impl_->cfg.abr_ki) o.ki = *impl_->cfg.abr_ki;
+        if (impl_->cfg.abr_kd) o.kd = *impl_->cfg.abr_kd;
         o.min_kbps      = impl_->cfg.abr_min_kbps;
         o.max_kbps      = impl_->cfg.abr_max_kbps;
         o.mpeg_version  = impl_->state.mpeg.version;

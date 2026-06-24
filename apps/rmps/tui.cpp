@@ -168,6 +168,11 @@ void Live::on_frame(const FrameStats &fs, const AbrState *abr,
       << " gated, cutoff " << std::setprecision(1)
       << (fs.transient_cutoff_hz / 1000.0) << " kHz\n";
   }
+  if (fs.short_block_granules > 0 || fs.transition_block_granules > 0) {
+    s << "  " << CYAN << "SHORT BLOCKS" << RESET
+      << "   " << fs.short_block_granules << " short, "
+      << fs.transition_block_granules << " transition\n";
+  }
 
   const std::string buf = s.str();
   out_ << buf;

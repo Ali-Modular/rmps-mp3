@@ -53,11 +53,31 @@ AbrController::AbrController(Options opt) : o_(std::move(opt)) {
         lo = std::min(lo, b);
         hi = std::max(hi, b);
     }
-    if (o_.min_kbps <= 0.0) o_.min_kbps = o_.target_kbps * 0.5;
-    // Wider upper headroom (2.5x default) so silence→attack frames can
-    // jump to a much higher bitrate index — the PID's integral pulls
-    // the long-term average back to target after the burst.
-    if (o_.max_kbps <= 0.0) o_.max_kbps = o_.target_kbps * 2.5;
+    if (o_.min_kbps <= 0.0) {
+        const double target_min = o_.target_kbps - 12.0;
+        int best_b = hi;
+        for (int i = 1; i < tables::NUM_BITRATES - 1; ++i) {
+            const int b = tables::bitrates[i][version];
+            if (b < 0) continue;
+            if (b >= target_min && b < best_b) {
+                best_b = b;
+            }
+        }
+        o_.min_kbps = static_cast<double>(best_b);
+    }
+    if (o_.max_kbps <= 0.0) {
+        const double target_max = o_.target_kbps + 48.0;
+        int best_b = hi;
+        for (int i = 1; i < tables::NUM_BITRATES - 1; ++i) {
+            const int b = tables::bitrates[i][version];
+            if (b < 0) continue;
+            if (b >= target_max && b < best_b) {
+                best_b = b;
+                break;
+            }
+        }
+        o_.max_kbps = static_cast<double>(best_b);
+    }
     o_.min_kbps = std::max(o_.min_kbps, static_cast<double>(lo));
     o_.max_kbps = std::min(o_.max_kbps, static_cast<double>(hi));
     last_decision_kbps_ = o_.target_kbps;
@@ -76,35 +96,57 @@ void AbrController::observe(int frame_bits, double frame_seconds,
         constexpr double WARM_FRAMES = 25.0;
         cum_seconds_ = WARM_FRAMES * frame_seconds;
         cum_bits_    = WARM_FRAMES * o_.target_kbps * 1000.0 * frame_seconds;
+        cum_seconds_local_ = WARM_FRAMES * frame_seconds;
+        cum_bits_local_    = WARM_FRAMES * o_.target_kbps * 1000.0 * frame_seconds;
     }
     cum_bits_    += frame_bits;
     cum_seconds_ += frame_seconds;
+    
+    // Update local average with a decay factor (~20 frames window)
+    constexpr double LOCAL_DECAY = 0.95;
+    cum_bits_local_    = LOCAL_DECAY * cum_bits_local_ + frame_bits;
+    cum_seconds_local_ = LOCAL_DECAY * cum_seconds_local_ + frame_seconds;
+    
     ++frames_;
 
-    const double avg = (cum_bits_ / cum_seconds_) / 1000.0;
-    last_avg_kbps_ = avg;
-    double err = o_.target_kbps - avg;
-    if (o_.target_sdr_db && frame_sdr_db) {
-        err += o_.sdr_weight * (*o_.target_sdr_db - *frame_sdr_db);
-    }
-    integral_ = o_.integral_leak * integral_ + err;
-    const double deriv = err - prev_err_;
-    prev_err_ = err;
-    last_err_ = err;
+    const double avg_local = (cum_bits_local_ / cum_seconds_local_) / 1000.0;
+    const double avg_global = (cum_bits_ / cum_seconds_) / 1000.0;
+    last_avg_kbps_ = avg_global;
 
-    const double u = o_.kp * err + o_.ki * integral_ + o_.kd * deriv;
+    // Local error for Proportional and Derivative terms (incorporating quality/SDR target)
+    double err_local = o_.target_kbps - avg_local;
+    if (o_.target_sdr_db && frame_sdr_db) {
+        err_local += o_.sdr_weight * (*o_.target_sdr_db - *frame_sdr_db);
+    }
+    
+    // Global error for Integral term (WITHOUT quality/SDR bias, ensuring perfect long-term convergence)
+    const double err_global = o_.target_kbps - avg_global;
+    
+    // Use a longer leak memory (0.995) for the global rate error integration.
+    // Freeze the integrator during silent frames to prevent windup.
+    const double integral_leak_to_use = std::max(0.995, o_.integral_leak);
+    if (!is_silent_frame_) {
+        integral_ = integral_leak_to_use * integral_ + err_global;
+    } else {
+        integral_ = integral_leak_to_use * integral_;
+    }
+
+    const double deriv_local = err_local - prev_err_;
+    prev_err_ = err_local;
+    last_err_ = err_local;
+
+    const double u = o_.kp * err_local + o_.ki * integral_ + o_.kd * deriv_local;
     last_u_ = u;
 
-    const double target = o_.target_kbps + u;
+    const double target = is_silent_frame_ ? 32.0 : (o_.target_kbps + u);
     last_decision_kbps_ =
         o_.smoothing * target + (1.0 - o_.smoothing) * last_decision_kbps_;
-    last_decision_kbps_ = std::clamp(last_decision_kbps_, o_.min_kbps, o_.max_kbps);
+    const double effective_min = is_silent_frame_ ? 32.0 : o_.min_kbps;
+    last_decision_kbps_ = std::clamp(last_decision_kbps_, effective_min, o_.max_kbps);
     // Deadband toward the target: snap small deviations exactly to the target
     // so the steady-state bitrate index (hence the HF cutoff) stops toggling
-    // between adjacent steps frame-to-frame. Larger, sustained deviations and
-    // transient-hint excursions are outside the band and still pass through, so
-    // ABR keeps adapting and the long-term average is preserved.
-    constexpr double DEADBAND_FRAC = 0.12;
+    // between adjacent steps frame-to-frame. Reduced to 3% to allow proper ABR tracking.
+    constexpr double DEADBAND_FRAC = 0.03;
     if (std::abs(last_decision_kbps_ - o_.target_kbps)
             < DEADBAND_FRAC * o_.target_kbps)
         last_decision_kbps_ = o_.target_kbps;
@@ -113,6 +155,7 @@ void AbrController::observe(int frame_bits, double frame_seconds,
 void AbrController::set_transient_hint(bool attack_from_silence,
                                        bool any_transient,
                                        bool all_silent) noexcept {
+    is_silent_frame_ = all_silent;
     if (attack_from_silence) {
         // Hard force: this is the worst pre-echo case, spend everything
         // we can on it. The PID's average tracking will pull subsequent
@@ -127,8 +170,8 @@ void AbrController::set_transient_hint(bool attack_from_silence,
         // Conserve bits during true silence. The PID would do this
         // eventually via the average; the hint just makes it immediate.
         last_decision_kbps_ = std::max(
-            o_.min_kbps,
-            last_decision_kbps_ - 0.5 * (last_decision_kbps_ - o_.min_kbps));
+            32.0,
+            last_decision_kbps_ - 0.5 * (last_decision_kbps_ - 32.0));
     }
 }
 

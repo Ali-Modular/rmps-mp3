@@ -2,6 +2,7 @@
 #include "quant/quantize.hpp"
 #include "core/encoder_state.hpp"
 #include "core/fixed.hpp"
+#include "core/tables.hpp"
 
 #include <algorithm>
 #include <array>
@@ -19,9 +20,7 @@ constexpr std::array<int, 22> PRETAB =
 int final_bits(int* ix_full, GrInfo& tmp, EncoderState& s) {
     calc_runlen(ix_full, tmp);
     int bits = count1_bitcount(ix_full, tmp);
-    subdivide(tmp, s);
-    bigv_tab_select(ix_full, tmp);
-    bits += bigv_bitcount(ix_full, tmp);
+    bits += best_subdivide_rd(ix_full, tmp, s);
     return bits;
 }
 }
@@ -36,12 +35,21 @@ int hf_rdo(int* ix_full, int& cur_bits,
            const std::array<int, NUM_SFB_LONG>& band_lens,
            const std::array<int, 23>& band_table,
            const std::array<double, 21>& weights,
+           const std::array<double, NUM_SFB_LONG>& tonality,
            EncoderState& s,
            GrInfo& tmp_gi,
            int hf_start_sfb,
            int hf_end_sfb) {
     (void)xrabs_bands;
+    (void)scale;
+    (void)preflag;
     const std::int64_t scalei_global = s.steptabi[gain + 127];
+
+    struct Cand { double dist_change; int j; int trial; int old; };
+    std::vector<Cand> cands;
+    cands.reserve(64);
+    std::vector<std::pair<int, int>> applied;
+    applied.reserve(64);
 
     // Weighted signal power (for per-swap cap).
     double weighted_signal = 0.0;
@@ -59,6 +67,11 @@ int hf_rdo(int* ix_full, int& cur_bits,
 
     const int sfb_end = std::min(hf_end_sfb, NUM_SFB_LONG);
     for (int sfb = hf_start_sfb; sfb < sfb_end; ++sfb) {
+        // Skip noise-like bands to preserve high-frequency noise.
+        if (tonality[sfb] < 0.30) {
+            continue;
+        }
+        cands.clear();
         // Effective shift = (sf + preflag*pretab) * (1+scale). We don't have sf
         // here — caller already produced ix using a given sf, so we re-derive
         // shift from gi by replaying the band's quantizer parameters via the
@@ -71,19 +84,19 @@ int hf_rdo(int* ix_full, int& cur_bits,
             const int v = ix_full[band_table[sfb] + j];
             if (v > 0) {
                 const double abs_xr = std::abs(static_cast<double>(xr_bands[sfb][j]));
-                const double pw = std::pow(static_cast<double>(v), 4.0 / 3.0);
+                const double pw = tables::pow43_tab[v];
                 if (pw > 0.0) { dequant_factor = abs_xr / pw; }
                 break;
             }
         }
         if (dequant_factor <= 0.0) {
             // Fallback: derive from scalei_global directly assuming sf=0.
-            dequant_factor = 4294967296.0 / static_cast<double>(scalei_global);
+            dequant_factor = (scalei_global > 0)
+                ? (4294967296.0 / static_cast<double>(scalei_global))
+                : 0.0;
         }
 
-        struct Cand { double dist_change; int j; int trial; int old; };
-        std::vector<Cand> cands;
-        cands.reserve(static_cast<std::size_t>(band_lens[sfb]));
+        // cands cleared at loop start
 
         const int start = band_table[sfb];
         const double w  = weights[sfb];
@@ -91,7 +104,7 @@ int hf_rdo(int* ix_full, int& cur_bits,
             const int cur_ix = ix_full[start + j];
             if (cur_ix == 0) continue;
             const double xr = xr_bands[sfb][j];
-            double cur_xhat = std::pow(static_cast<double>(cur_ix), 4.0 / 3.0) * dequant_factor;
+            double cur_xhat = tables::pow43_tab[cur_ix] * dequant_factor;
             if (xr < 0) cur_xhat = -cur_xhat;
             const double cur_err2 = (xr - cur_xhat) * (xr - cur_xhat);
 
@@ -99,9 +112,7 @@ int hf_rdo(int* ix_full, int& cur_bits,
             for (int trial : {cur_ix - 1, 0}) {
                 if (trial < 0 || trial == cur_ix) continue;
                 if (trial == cur_ix - 1 && trial == 0) continue;
-                double trial_xhat = (trial > 0)
-                    ? std::pow(static_cast<double>(trial), 4.0 / 3.0) * dequant_factor
-                    : 0.0;
+                double trial_xhat = tables::pow43_tab[trial] * dequant_factor;
                 if (xr < 0) trial_xhat = -trial_xhat;
                 const double trial_err2 = (xr - trial_xhat) * (xr - trial_xhat);
                 const double dist_change = (trial_err2 - cur_err2) * w;
@@ -117,7 +128,7 @@ int hf_rdo(int* ix_full, int& cur_bits,
                   [](const Cand& a, const Cand& b) { return a.dist_change < b.dist_change; });
 
         // Apply all tentatively.
-        std::vector<std::pair<int, int>> applied;   // (j, old)
+        applied.clear();
         applied.reserve(cands.size());
         double total_dist_change = 0.0;
         for (const auto& c : cands) {

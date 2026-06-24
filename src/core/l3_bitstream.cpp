@@ -78,10 +78,17 @@ void huffman_code_bits(EncoderState& s, Bitstream& bs, int* ix, GrInfo& gi) {
     const std::size_t start_bits = bs.bit_count();
     const int bigvalues = gi.big_values << 1;
 
-    int scalefac_index = gi.region0_count + 1;
-    int region1Start   = sfb[scalefac_index];
-    scalefac_index    += gi.region1_count + 1;
-    int region2Start   = sfb[scalefac_index];
+    int region1Start, region2Start;
+    if (gi.window_switching_flag && gi.block_type == BLOCK_SHORT) {
+        // Short blocks: fixed region split at coefficient 36; no region2.
+        region1Start = 36;
+        region2Start = bigvalues;
+    } else {
+        int scalefac_index = gi.region0_count + 1;
+        region1Start   = sfb[scalefac_index];
+        scalefac_index += gi.region1_count + 1;
+        region2Start   = sfb[scalefac_index];
+    }
 
     for (int i = 0; i < bigvalues; i += 2) {
         const int region = (i >= region1Start ? 1 : 0) + (i >= region2Start ? 1 : 0);
@@ -150,13 +157,22 @@ void encode_side_info(EncoderState& s, Bitstream& bs, int main_data_begin) {
             bs.putbits(static_cast<std::uint32_t>(gi.global_gain),        8);
             if (mpeg.version == 3) bs.putbits(static_cast<std::uint32_t>(gi.scalefac_compress), 4);
             else                   bs.putbits(static_cast<std::uint32_t>(gi.scalefac_compress), 9);
-            bs.putbits(0, 1);                              // window_switching_flag = 0
 
-            for (int region = 0; region < 3; ++region)
-                bs.putbits(static_cast<std::uint32_t>(gi.table_select[region]), 5);
-
-            bs.putbits(static_cast<std::uint32_t>(gi.region0_count), 4);
-            bs.putbits(static_cast<std::uint32_t>(gi.region1_count), 3);
+            bs.putbits(static_cast<std::uint32_t>(gi.window_switching_flag), 1);
+            if (gi.window_switching_flag) {
+                bs.putbits(static_cast<std::uint32_t>(gi.block_type),       2);
+                bs.putbits(static_cast<std::uint32_t>(gi.mixed_block_flag), 1);
+                // Only two table_select entries for window-switched blocks.
+                for (int region = 0; region < 2; ++region)
+                    bs.putbits(static_cast<std::uint32_t>(gi.table_select[region]), 5);
+                for (int w = 0; w < 3; ++w)
+                    bs.putbits(static_cast<std::uint32_t>(gi.subblock_gain[w]), 3);
+            } else {
+                for (int region = 0; region < 3; ++region)
+                    bs.putbits(static_cast<std::uint32_t>(gi.table_select[region]), 5);
+                bs.putbits(static_cast<std::uint32_t>(gi.region0_count), 4);
+                bs.putbits(static_cast<std::uint32_t>(gi.region1_count), 3);
+            }
 
             if (mpeg.version == 3) bs.putbits(static_cast<std::uint32_t>(gi.preflag), 1);
             bs.putbits(static_cast<std::uint32_t>(gi.scalefac_scale),     1);
@@ -176,14 +192,25 @@ void encode_main_data(EncoderState& s, Bitstream& md) {
             auto& ix  = s.l3_enc[ch][gr];
             auto& scf = si.scfsi[ch];
 
-            if (gr == 0 || scf[0] == 0)
-                for (int sfb = 0; sfb < 6;  ++sfb) md.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen1);
-            if (gr == 0 || scf[1] == 0)
-                for (int sfb = 6; sfb < 11; ++sfb) md.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen1);
-            if (gr == 0 || scf[2] == 0)
-                for (int sfb = 11; sfb < 16;++sfb) md.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen2);
-            if (gr == 0 || scf[3] == 0)
-                for (int sfb = 16; sfb < 21;++sfb) md.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen2);
+            if (gi.window_switching_flag && gi.block_type == BLOCK_SHORT) {
+                // Short block: per (sfb, window) scalefactors; no scfsi.
+                // sfb 0..5 use slen1, sfb 6..11 use slen2 (sfb 12 is implicit 0).
+                for (int sfb = 0; sfb < 6; ++sfb)
+                    for (int w = 0; w < NUM_WINDOWS; ++w)
+                        md.putbits(static_cast<std::uint32_t>(s.scalefactor.s[gr][ch][w][sfb]), slen1);
+                for (int sfb = 6; sfb < 12; ++sfb)
+                    for (int w = 0; w < NUM_WINDOWS; ++w)
+                        md.putbits(static_cast<std::uint32_t>(s.scalefactor.s[gr][ch][w][sfb]), slen2);
+            } else {
+                if (gr == 0 || scf[0] == 0)
+                    for (int sfb = 0; sfb < 6;  ++sfb) md.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen1);
+                if (gr == 0 || scf[1] == 0)
+                    for (int sfb = 6; sfb < 11; ++sfb) md.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen1);
+                if (gr == 0 || scf[2] == 0)
+                    for (int sfb = 11; sfb < 16;++sfb) md.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen2);
+                if (gr == 0 || scf[3] == 0)
+                    for (int sfb = 16; sfb < 21;++sfb) md.putbits(static_cast<std::uint32_t>(s.scalefactor.l[gr][ch][sfb]), slen2);
+            }
 
             huffman_code_bits(s, md, ix.data(), gi);
         }

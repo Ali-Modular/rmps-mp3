@@ -1,7 +1,9 @@
 #include "control/transient_gate.hpp"
+#include "core/encoder_state.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace rmps::control {
 
@@ -31,45 +33,77 @@ constexpr double ABS_ENERGY_FLOOR =
 // We keep a very gentle trim on attack-from-silence only, to suppress
 // the sharpest of the long-block pre-echo smear. Everything else passes
 // through and the cost function decides.
-constexpr double TRANSIENT_CUTOFF_HZ = 20000.0;
-constexpr double PRE_WINDOW_CUTOFF_HZ = 20000.0;
+constexpr double TRANSIENT_CUTOFF_HZ = 18000.0;
+constexpr double PRE_WINDOW_CUTOFF_HZ = 13000.0;
 constexpr double NO_TRANSIENT_CUTOFF_HZ = 20000.0;
-constexpr double ATTACK_FROM_SILENCE_CUTOFF_HZ = 16000.0;
+constexpr double ATTACK_FROM_SILENCE_CUTOFF_HZ = 15000.0;
 
 // Below this sub-window energy we consider the region "silent" for the
 // purpose of detecting attacks-from-silence. 1e5 over 192 samples ≈ 22 RMS
 // in 16-bit, well under any musical content but above quiet dither.
 constexpr double SILENCE_ENERGY_THRESHOLD = 1.0e5;
 
+// Length of the boxcar low-pass used to isolate the bass / low-mid band when
+// classifying a transient. At 48 kHz a 16-tap moving average has its first null
+// at 3 kHz (−3 dB ≈ 1.3 kHz), so its output energy tracks the content below
+// ~1 kHz — i.e. the bass a short block would damage.
+constexpr int LF_BOXCAR = 16;
+
 struct SubWindowMetrics {
   double energy;
   double peak;
   double rms;
+  /// First-difference (high-pass) energy — large for a hi-hat / snap, tiny for
+  /// a bass thump.
+  double hf_energy;
+  /// Boxcar-low-pass energy — the bass / low-mid content a short block would
+  /// damage. We classify an attack as short-block-worthy only when its HF
+  /// energy clearly dominates this, so a broadband hit that still carries
+  /// heavy bass (kick, bass-note onset, snare-with-body) stays on long blocks.
+  double lf_energy;
 };
 
 SubWindowMetrics measure_subwindow(const std::int16_t *pcm, int start, int len,
                                    int interleave, int channels) {
-  double e = 0.0;
-  int pk = 0;
-  for (int i = 0; i < len; ++i) {
-    // Use mid (L+R)/2 to be channel-agnostic without quirks.
-    int s;
+  auto mid = [&](int idx) {
     if (channels == 2) {
-      const int l = pcm[(start + i) * interleave + 0];
-      const int r = pcm[(start + i) * interleave + 1];
-      s = (l + r) / 2;
-    } else {
-      s = pcm[(start + i) * interleave];
+      const int l = pcm[(start + idx) * interleave + 0];
+      const int r = pcm[(start + idx) * interleave + 1];
+      return (l + r) / 2;
     }
+    return static_cast<int>(pcm[(start + idx) * interleave]);
+  };
+  double e = 0.0;
+  double hf = 0.0;
+  double lf = 0.0;
+  int pk = 0;
+  int prev = 0;
+  double box = 0.0; // running sum of the last LF_BOXCAR samples
+  for (int i = 0; i < len; ++i) {
+    const int s = mid(i);
     const int a = std::abs(s);
     if (a > pk)
       pk = a;
     e += static_cast<double>(s) * static_cast<double>(s);
+    if (i > 0) {
+      const double d = static_cast<double>(s - prev);
+      hf += d * d;
+    }
+    prev = s;
+    box += s;
+    if (i >= LF_BOXCAR)
+      box -= mid(i - LF_BOXCAR);
+    if (i >= LF_BOXCAR - 1) {
+      const double avg = box / LF_BOXCAR;
+      lf += avg * avg;
+    }
   }
   SubWindowMetrics m{};
   m.energy = std::max(e, 1.0);
   m.peak = pk;
   m.rms = std::sqrt(m.energy / std::max(len, 1));
+  m.hf_energy = hf;
+  m.lf_energy = std::max(lf, 1.0);
   return m;
 }
 
@@ -148,14 +182,29 @@ void TransientGate::analyse_frame(const std::int16_t *pcm,
     bool any_from_silence = false;
     bool all_silent = true;
     double best_ratio = 0.0;
+    int first_attack_sub = -1;      // earliest attacking sub-window
+    double best_contrast = 1.0;     // strongest energy jump
     for (int w = 0; w < SUBWINDOWS_PER_GR; ++w) {
       const int s = gr * SUBWINDOWS_PER_GR + w;
+      // Store per-sub-window energy in the decision.
+      decisions_[gr].sub_energies[w] = per_sub[s].energy;
       if (trig[s]) {
         any = true;
         if (from_silence[s])
           any_from_silence = true;
         if (pk_ratio[s] > best_ratio)
           best_ratio = pk_ratio[s];
+        if (first_attack_sub < 0)
+          first_attack_sub = w;
+        // Energy contrast: ratio of this sub to the previous sub.
+        double prev_sub_e = 1.0;
+        if (s > 0)
+          prev_sub_e = std::max(per_sub[s - 1].energy, 1.0);
+        else if (!cold_start)
+          prev_sub_e = std::max(last_window_energy_, 1.0);
+        const double contrast = per_sub[s].energy / prev_sub_e;
+        if (contrast > best_contrast)
+          best_contrast = contrast;
       }
       if (per_sub[s].energy >= SILENCE_ENERGY_THRESHOLD)
         all_silent = false;
@@ -166,6 +215,23 @@ void TransientGate::analyse_frame(const std::int16_t *pcm,
     // first sub-window is.
     decisions_[gr].silent = all_silent && !any;
     decisions_[gr].peak_rms_ratio = best_ratio;
+    decisions_[gr].attack_sub_index = first_attack_sub;
+    decisions_[gr].energy_contrast = best_contrast;
+    // Classify the attack as HF-rich (hi-hat/snare → short block worthwhile) vs
+    // a low-frequency thump (kick/bass onset → keep long for clean bass) from
+    // the first-difference energy fraction of the attacking sub-window.
+    if (any && first_attack_sub >= 0) {
+      const auto &am = per_sub[gr * SUBWINDOWS_PER_GR + first_attack_sub];
+      // Compare the attack's high-frequency energy directly against its bass /
+      // low-mid energy. A short block is only worth its bass-resolution cost
+      // when the HF clearly dominates (hi-hat, snare snap, cymbal); any attack
+      // whose energy is still carried by the low end — a kick, a bass-note
+      // onset, or a snare/clap with body — stays long so the bass keeps full
+      // frequency resolution. This ratio test rejects broadband bass-heavy
+      // hits that a plain HF-fraction test let through.
+      const double hf_to_lf = am.hf_energy / am.lf_energy;
+      decisions_[gr].hf_transient = hf_to_lf >= hf_transient_threshold_;
+    }
     decisions_[gr].cutoff_hz = any_from_silence ? ATTACK_FROM_SILENCE_CUTOFF_HZ
                                : any            ? TRANSIENT_CUTOFF_HZ
                                                 : NO_TRANSIENT_CUTOFF_HZ;
@@ -181,12 +247,65 @@ void TransientGate::analyse_frame(const std::int16_t *pcm,
           std::min(decisions_[gr - 1].cutoff_hz, PRE_WINDOW_CUTOFF_HZ);
     }
   }
+
+  // Cross-frame pre_window: if the first granule of this frame is a
+  // transient, the *last* granule of the *previous* frame should have been
+  // flagged as pre_window. We cannot retroactively change the already-
+  // encoded frame, but the encoder can use prev_frame_last_decision() to
+  // apply the pre_window masking penalty to the masking history, which
+  // carries forward into this frame's thresholds via the post-mask decay.
+  // (The actual application happens in encoder.cpp run_frame.)
+  //
+  // Save a snapshot of the current frame's last granule *before* overwrite.
+  prev_frame_last_decision_ = decisions_[granules_per_frame - 1];
 }
 
 TransientGate::Decision TransientGate::decision_for(int gr) const noexcept {
   if (gr < 0 || gr >= static_cast<int>(std::size(decisions_)))
     return {};
   return decisions_[gr];
+}
+
+void decide_block_types(EncoderState& s) {
+  const int G = s.mpeg.granules_per_frame;
+  for (int gr = 0; gr < G; ++gr) {
+    // Desired block from the PCM-domain transient analysis. Only HF-rich
+    // attacks (hi-hats, snares, broadband clicks) warrant a short block; a
+    // low-frequency transient (kick, bass-note onset) stays long so its bass
+    // keeps full frequency resolution. pre_window marks the granule before an
+    // attack — the natural place for the START transition so the SHORT lands on
+    // the attack itself, but only when that next attack is itself HF-rich.
+    int desired = BLOCK_LONG;
+    if (s.cfg_block_switching) {
+      if (s.transient_flags[gr] && s.hf_transient_flags[gr]) {
+        desired = BLOCK_SHORT;
+      } else if (s.pre_window_flags[gr] && gr + 1 < G &&
+                 s.transient_flags[gr + 1] && s.hf_transient_flags[gr + 1]) {
+        desired = BLOCK_START;
+      }
+    }
+
+    // Reconcile against the previous granule's block type so the emitted
+    // sequence is always a legal window-switching transition:
+    //   LONG  -> LONG | START          STOP  -> LONG | START
+    //   START -> SHORT (forced)        SHORT -> SHORT | STOP
+    const int prev = s.prev_block_type[0];
+    int block;
+    if (prev == BLOCK_START) {
+      block = BLOCK_SHORT;                                   // start must precede short
+    } else if (prev == BLOCK_SHORT) {
+      block = (desired == BLOCK_LONG) ? BLOCK_STOP : BLOCK_SHORT;
+    } else if (prev == BLOCK_STOP) {
+      block = (desired == BLOCK_LONG) ? BLOCK_LONG : BLOCK_START;
+    } else { // prev == BLOCK_LONG
+      block = (desired == BLOCK_LONG) ? BLOCK_LONG : BLOCK_START;
+    }
+
+    for (int ch = 0; ch < MAX_CHANNELS; ++ch) {
+      s.block_type[ch][gr] = block;
+      s.prev_block_type[ch] = block;
+    }
+  }
 }
 
 } // namespace rmps::control
