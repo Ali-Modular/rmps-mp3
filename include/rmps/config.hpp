@@ -36,8 +36,8 @@ struct Config {
   // --- Adaptive features ---
   /// Optional ABR target in kbps. nullopt => CBR at `bitrate`.
   std::optional<int> abr_target_kbps{};
-  int abr_min_kbps = 0;  ///< 0 = use abr_target - 12 (rounded up)
-  int abr_max_kbps = 0;  ///< 0 = use abr_target + 48 (rounded up)
+  int abr_min_kbps = 0; ///< 0 = use abr_target - 12 (rounded up)
+  int abr_max_kbps = 0; ///< 0 = use abr_target + 48 (rounded up)
   /// Optional perceptual SDR floor (dB) for ABR; nullopt disables steering.
   std::optional<double> target_sdr_db{90.0};
   /// Enable adaptive joint-stereo (M/S vs L/R decision per frame).
@@ -53,12 +53,17 @@ struct Config {
   /// resolution — short blocks otherwise turn the sustained bass into audible
   /// quant noise at the attack. Higher = more conservative (fewer short
   /// blocks). Default 5.0.
-  double short_block_hf_threshold = 5.0;
+  double short_block_hf_threshold = 1.5;
 
   // --- Quality knobs ---
-  int beam_width = 128;
-  int gain_window = 32; ///< ±N around bin-search seed
-  int sf_max_candidate = 12;
+  /// Complexity effort level in [0..10]. Default 7. Controls the tradeoff
+  /// between encode speed and audio quality (SDR/NMR).
+  int effort = 7;
+  /// Explicit overrides for beam search knobs. If negative, they are
+  /// auto-derived from the `effort` level.
+  int beam_width = -1;
+  int gain_window = -1; ///< ±N around bin-search seed
+  int sf_max_candidate = -1;
   double noise_shaping_alpha = 0.25; ///< 0..0.95
   double hf_max_atten_m_db = 0.0;    ///< HFAdaptor cap (M)
   double hf_max_atten_s_db = 1.0;    ///< HFAdaptor cap (S)
@@ -69,7 +74,7 @@ struct Config {
   /// 0.0 = legacy SDR (safe default during model bring-up).
   /// 0.3 = NMR-assisted, SDR-dominant (recommended starter).
   /// 1.0 = pure NMR.
-  double mask_alpha = 0.0;
+  double mask_alpha = 0.3;
   /// Override for the per-band RDO Lagrange multiplier λ_R in the
   /// beam-search cost. Negative = auto-derive from bitrate (default).
   double mask_lambda_R = -1.0;
@@ -79,10 +84,10 @@ struct Config {
   /// to spend more bits keeping the bass clean. Applied *after* the ATH
   /// floor, so it may demand precision below absolute audibility. Default
   /// 10 dB (strong, bass-favouring); set to 0.0 to disable.
-  double lf_strict_db = 12.0;
+  double lf_strict_db = 6.0;
   /// Upper edge (Hz) of the LF strictness region. The effect is full below
   /// this and tapers off over ~1 Bark above it. Default 1 kHz.
-  double lf_strict_cutoff_hz = 1000.0;
+  double lf_strict_cutoff_hz = 200.0;
 
   /// Input-side pre-attenuation in dB applied to PCM samples before
   /// any analysis. The codec has a structural ~2 dB loudness shift
@@ -98,10 +103,19 @@ struct Config {
   /// Default 2.5 (strong HF preservation). Higher values bias toward HF.
   double hf_weight_boost = 2.5;
 
+  /// Gain boost factor applied directly to MDCT coefficients above the adaptive clamp frequency (4kHz-14kHz).
+  /// Values > 1.0 make high-frequency coefficients larger, preventing them
+  /// from being zeroed out during quantization. Default 1.0 (no boost).
+  double hf_gain_boost_14k = 1.0;
+
+  /// Boost in dB (0.0 to 24.0) applied to coefficients above the adaptive clamp frequency (4kHz-14kHz)
+  /// that would otherwise be quantized to 0. Default 4.0 (4dB).
+  double hf_zero_boost_db = 4.0;
+
   /// Waveform preservation regularization strength in [0..1.0].
-  /// Penalizes raw distortion independently of psychoacoustic masking thresholds,
-  /// preserving overall waveform shape. Default 0.05.
-  double waveform_reg = 0.05;
+  /// Penalizes raw distortion independently of psychoacoustic masking
+  /// thresholds, preserving overall waveform shape. Default 0.05.
+  double waveform_reg = 0.2;
 
   // --- PID gains override ---
   std::optional<double> abr_kp{};

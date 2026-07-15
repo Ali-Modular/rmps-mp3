@@ -39,6 +39,9 @@ struct CliOpts {
     std::optional<double> hf_weight_boost;
     std::optional<double> lf_strict_db;
     std::optional<double> waveform_reg;
+    std::optional<double> hf_gain_boost_14k;
+    std::optional<double> hf_zero_boost_db;
+    std::optional<int>    effort;
     std::optional<std::string> pid;
     bool   block_switching = true; // short blocks on transients (--no-short-blocks)
     double short_block_hf_threshold = 5.0; // HF/bass energy ratio gate for short blocks
@@ -67,11 +70,17 @@ void usage(std::FILE* out) {
         "      --pid Kp,Ki,Kd      override PID gains. [0.5,0.12,0.04]\n"
         "\n"
         "QUALITY KNOBS\n"
+        "  -e, --effort LEVEL      complexity effort in [0..10]. Higher is slower but\n"
+        "                          preserves more SDR/NMR. [7]\n"
         "      --shaping ALPHA     noise-shaping coefficient in [0..0.95]. [0.5]\n"
         "      --pre-gain DB       input PCM attenuation in dB (compensates a\n"
         "                          structural +~2 dB shift in the pipeline). [-2.0]\n"
         "      --hf-boost N        per-band weight multiplier for SFB 17–20\n"
         "                          (~7–16 kHz). >1 preserves hi-hat sizzle. [2.5]\n"
+        "      --hf-gain-boost N   coefficient gain boost multiplier for MDCT\n"
+        "                          coefficients above the adaptive clamp (4–14kHz). [1.0]\n"
+        "      --hf-zero-boost DB  boost in dB for coefficients above the adaptive clamp\n"
+        "                          (4–14kHz) that would be quantized to 0 (max 24.0). [4.0]\n"
         "      --lf-strict DB      lower the masking threshold below 1 kHz by DB,\n"
         "                          spending more bits on clean bass. 0=off. [10]\n"
         "      --waveform-reg VAL  waveform preservation regularization in [0..1.0]. [0.05]\n"
@@ -113,9 +122,12 @@ int parse_args(int argc, char** argv, CliOpts& opts) {
         else if (a == "-b" || a == "--bitrate") { auto v = need(i); if (!v) return 2; if (!parse_int(v, opts.bitrate)) return 2; opts.cbr_explicit = true; ++i; }
         else if (a == "-d" || a == "--duration"){ auto v = need(i); if (!v) return 2; if (!parse_double(v, opts.duration_s)) return 2; ++i; }
         else if (a == "--freq")             { auto v = need(i); if (!v) return 2; if (!parse_double(v, opts.freq_hz)) return 2; ++i; }
+        else if (a == "-e" || a == "--effort") { auto v = need(i); if (!v) return 2; int d; if (!parse_int(v, d)) return 2; opts.effort = d; ++i; }
         else if (a == "--shaping")          { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.shaping = d; ++i; }
         else if (a == "--pre-gain")         { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.pre_gain_db = d; ++i; }
         else if (a == "--hf-boost")         { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.hf_weight_boost = d; ++i; }
+        else if (a == "--hf-gain-boost")    { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.hf_gain_boost_14k = d; ++i; }
+        else if (a == "--hf-zero-boost")     { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.hf_zero_boost_db = d; ++i; }
         else if (a == "--lf-strict")        { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.lf_strict_db = d; ++i; }
         else if (a == "--waveform-reg")     { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.waveform_reg = d; ++i; }
         else if (a == "--abr")              { auto v = need(i); if (!v) return 2; int d; if (!parse_int(v, d)) return 2; opts.abr_kbps = d; ++i; }
@@ -239,8 +251,11 @@ int main(int argc, char** argv) {
         std::clamp(*opts.shaping, 0.0, 0.95);
     if (opts.pre_gain_db)   ccfg.pre_gain_db = *opts.pre_gain_db;
     if (opts.hf_weight_boost) ccfg.hf_weight_boost = *opts.hf_weight_boost;
+    if (opts.hf_gain_boost_14k) ccfg.hf_gain_boost_14k = *opts.hf_gain_boost_14k;
+    if (opts.hf_zero_boost_db)  ccfg.hf_zero_boost_db  = *opts.hf_zero_boost_db;
     if (opts.lf_strict_db)    ccfg.lf_strict_db    = *opts.lf_strict_db;
     if (opts.waveform_reg)    ccfg.waveform_reg    = *opts.waveform_reg;
+    if (opts.effort)          ccfg.effort          = *opts.effort;
     ccfg.block_switching = opts.block_switching;
     ccfg.short_block_hf_threshold = opts.short_block_hf_threshold;
     if (opts.pid) {

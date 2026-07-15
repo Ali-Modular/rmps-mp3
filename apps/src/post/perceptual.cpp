@@ -1,0 +1,77 @@
+#include "post/perceptual.hpp"
+#include "core/tables.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <mutex>
+#include <unordered_map>
+
+namespace rmps::post {
+
+namespace {
+
+constexpr double MS_IMAGE_FACTOR = 0.70;   // 500..3 kHz preserved (was 0.60)
+constexpr double MS_OUTER_FACTOR = 0.45;   // outside that band (was 0.30)
+
+double a_weight_db(double f) {
+    if (f < 10.0) return -50.0;
+    const double f2  = f * f;
+    const double num = 12194.0 * 12194.0 * f2 * f2;
+    const double den = (f2 + 20.6 * 20.6) * (f2 + 12194.0 * 12194.0)
+                     * std::sqrt((f2 + 107.7 * 107.7) * (f2 + 737.9 * 737.9));
+    if (den <= 0.0) return -50.0;
+    return 20.0 * std::log10(std::max(num / den, 1e-6)) + 2.0;
+}
+
+struct CacheKey { int sr_index; bool side; bool operator==(const CacheKey& o) const noexcept { return sr_index == o.sr_index && side == o.side; }};
+struct CacheHash { std::size_t operator()(const CacheKey& k) const noexcept {
+    return static_cast<std::size_t>(k.sr_index) * 2u + (k.side ? 1u : 0u);
+}};
+
+std::unordered_map<CacheKey, std::array<double, NUM_SFB_LONG_>, CacheHash> g_cache;
+std::mutex g_cache_mu;
+
+} // namespace
+
+const std::array<double, NUM_SFB_LONG_>&
+perceptual_weights(int samplerate_index, int samplerate, bool is_side_channel) {
+    CacheKey key {samplerate_index, is_side_channel};
+    std::lock_guard<std::mutex> lk(g_cache_mu);
+    auto it = g_cache.find(key);
+    if (it != g_cache.end()) return it->second;
+
+    std::array<double, NUM_SFB_LONG_> w {};
+    const auto& sfb = tables::scale_fact_band_index[samplerate_index];
+    for (int s = 0; s < NUM_SFB_LONG_; ++s) {
+        const double center_sample = (sfb[s] + sfb[s + 1]) * 0.5;
+        const double f_hz = center_sample * samplerate / (2.0 * 576.0);
+        double v = std::pow(10.0, a_weight_db(f_hz) / 20.0);
+        if (is_side_channel) {
+            if (f_hz >= 500.0) {
+                v *= (f_hz <= 3000.0) ? MS_IMAGE_FACTOR : MS_OUTER_FACTOR;
+            }
+        }
+        w[s] = v;
+    }
+    double wmax = *std::max_element(w.begin(), w.end());
+    if (wmax <= 0.0) wmax = 1.0;
+    for (auto& x : w) x = std::max(x / wmax, 0.05);
+    // Bass floor: A-weighting gives 100 Hz bands only ~5% of mid-range
+    // weight, causing the beam search to practically ignore bass distortion.
+    // Bass noise is perceptually more prominent than raw A-weighting suggests
+    // (sparse spectral content exposes it, transient timing is critical, and
+    // low frequencies are physically felt). Raise the floor so bass distortion
+    // costs at least 30% of mid-range, tapering to 15% at 400 Hz.
+    for (int s = 0; s < NUM_SFB_LONG_; ++s) {
+        const double cs = (sfb[s] + sfb[s + 1]) * 0.5;
+        const double fhz = cs * samplerate / (2.0 * 576.0);
+        if (fhz < 200.0)
+            w[s] = std::max(w[s], 0.30);
+        else if (fhz < 400.0)
+            w[s] = std::max(w[s], 0.15);
+    }
+    auto [ins, _] = g_cache.emplace(key, w);
+    return ins->second;
+}
+
+} // namespace rmps::post
