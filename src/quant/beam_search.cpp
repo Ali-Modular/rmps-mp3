@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 namespace rmps::quant {
@@ -103,7 +105,8 @@ QuantOut quantize_band(const std::int32_t* xrabs_band, int n,
                        std::int64_t scalei_global, [[maybe_unused]] double steptab_global,
                        int sf, int scale, int preflag, int sfb,
                        const std::array<int, 262144>& int2idx,
-                       double alpha) {
+                       double alpha, double zero_boost_factor = 1.0,
+                       double zero_fill_exp = 1.0) {
     QuantOut out;
     const int eff_sf = sf + (preflag ? PRETAB[static_cast<std::size_t>(sfb)] : 0);
     const double sf_mult = tables::pow2_half_tab[static_cast<std::size_t>((1 + scale) * eff_sf)];
@@ -152,6 +155,77 @@ QuantOut quantize_band(const std::int32_t* xrabs_band, int n,
             err = x_hat - target_f;
         }
     }
+
+    // --- Transparent zero fill ("black-spot boost", --hf-zero-boost) ---
+    // A coefficient just below the dead-zone boundary quantizes to 0; runs
+    // of them decode as spectral holes (黒点). Promote such zeros to |ix|=1
+    // with a *level-dependent, compressive* (companding) law — a uniform
+    // gain would lift a near-boundary coefficient and a deeply quiet one by
+    // the same amount, which over-fills the quiet ones. The quantizer can
+    // only write 0 or 1 below the first level, so the curve is realised in
+    // fill *density* (expected energy) via error diffusion:
+    //   • per-bin fill-energy aim  T = e1 · u · min(1, u·K)  with
+    //     u = x/x̂₁ (depth below the level-1 amplitude) and K the energy-
+    //     domain boost cap. Near the boundary (u→1) T→e1: the bin is
+    //     simply kept, ≈0 dB boost. Deeper bins follow T = e1·u — a lift
+    //     of half the depth in dB (compressive: quiet bins gain relatively
+    //     more, loud bins less) — until the cap clamps the lift at
+    //     +zb dB (T = x²·K), so near-silence is never fabricated into
+    //     content;
+    //   • an accumulator promotes a bin (|ix|=1) each time the summed aim
+    //     reaches e1, loudest first, so the aggregate spectrum follows the
+    //     curve exactly even though single bins are all-or-nothing;
+    //   • energy cap — the fill only spends the band's actual energy
+    //     deficit (source energy minus the coded reconstruction). A band
+    //     whose coded bins already sit at the source level gets no fill at
+    //     all, so the reconstructed band can never come out louder than
+    //     the source.
+    if (zero_boost_factor > 1.0) {
+        double src_e   = 0.0;
+        double recon_e = 0.0;
+        std::array<int, 256> cand {};
+        int n_cand = 0;
+        for (int j = 0; j < n; ++j) {
+            const double x = static_cast<double>(xrabs_band[j]);
+            src_e += x * x;
+            const int v = out.ix[static_cast<std::size_t>(j)];
+            if (v != 0) {
+                const double x_hat = tables::pow43_tab[v] * dequant_factor;
+                recon_e += x_hat * x_hat;
+                continue;
+            }
+            if (x > 0.0) cand[n_cand++] = j;
+        }
+        const double budget = src_e - recon_e;
+        if (n_cand > 0 && budget > 0.0) {
+            std::sort(cand.begin(), cand.begin() + n_cand,
+                      [&](int a, int b) { return xrabs_band[a] > xrabs_band[b]; });
+            const double x1 = tables::pow43_tab[1] * dequant_factor;
+            const double e1 = x1 * x1;
+            const double K  = zero_boost_factor * zero_boost_factor;
+            double filled = 0.0;
+            double acc    = 0.0;
+            for (int k = 0; k < n_cand; ++k) {
+                const double x = static_cast<double>(
+                    xrabs_band[cand[static_cast<std::size_t>(k)]]);
+                const double u = std::min(1.0, x / x1);
+                // zero_fill_exp < 1 flattens the compressive curve (starved
+                // bitrates): deeper coefficients then contribute enough aim
+                // energy to actually get promoted.
+                const double u_curve =
+                    (zero_fill_exp < 1.0) ? std::pow(u, zero_fill_exp) : u;
+                acc += e1 * u_curve * std::min(1.0, u * K);
+                if (acc < e1) continue;
+                if (filled + e1 > budget) break;
+                out.ix[static_cast<std::size_t>(
+                    cand[static_cast<std::size_t>(k)])] = 1;
+                filled += e1;
+                acc    -= e1;
+            }
+            if (filled > 0.0 && max_val < 1) max_val = 1;
+        }
+    }
+
     out.ok = true;
     out.max_val = max_val;
     out.scalei_band = scalei;
@@ -343,7 +417,13 @@ inline double hybrid_band_cost(int sfb, double D_b, double E_recon_b,
     // band energy to the source/masked target rather than per-bin phase, so
     // the search may pick a coarse quantization that yields noise at the right
     // level — perceptually equivalent to the source's own noisy HF content.
-    const double target_e   = std::max(e_band_b, thr_b);
+    // The aim point tracks the source's own band level. The former aim of
+    // max(e_band, thr) let a generous masking threshold pull the fill level
+    // above the source; whenever the threshold over-estimates, that decodes
+    // as audible extra hiss (the fill itself becomes a boost). Cap the masked
+    // headroom at +3 dB over the source energy so the fill stays
+    // indistinguishable from the content it replaces.
+    const double target_e   = std::max(e_band_b, std::min(thr_b, 2.0 * e_band_b));
     const double level_diff = target_e - E_recon_b;
     const double p_level = (level_diff * level_diff) / std::max(target_e, 1.0)
                          * weight_eff;
@@ -440,7 +520,7 @@ BeamResult beam_search(int max_bits, int* ix, int gr, int ch, EncoderState& s,
     // hybrid cost then degenerates gracefully to legacy SDR via α=0.
     const auto& mt        = s.mask_thresholds[ch][gr];
     const double m_alpha    = s.mask_params.alpha;
-    const double m_lambda_R = s.mask_params.lambda_R;
+    const double m_lambda_R = s.mask_params.lambda_R * s.lambda_granule_scale;
     const double m_waveform_reg = s.mask_params.waveform_reg;
     const bool granule_is_transient =
         s.transient_flags[gr] || s.attack_from_silence_flags[gr]
@@ -466,6 +546,45 @@ BeamResult beam_search(int max_bits, int* ix, int gr, int ch, EncoderState& s,
         }
         eff_hf_boost = std::max(1.0, s.hf_weight_boost * br_factor);
     }
+
+    // Shared low-bitrate ramp in [0,1]: 0 at ≥128 kbps, 1 at 32 kbps. The
+    // black-spot fill scales with it — at starved rates the dead zone eats
+    // far more of the spectrum, so the fill may reach deeper and closer to
+    // the source level. Transparency is preserved regardless: every fill
+    // path stays capped at the band's actual energy deficit.
+    double low_rate_t = 0.0;
+    if (s.mpeg.bitr > 0 && s.mpeg.bitr < 128)
+        low_rate_t = std::clamp((128.0 - s.mpeg.bitr) / (128.0 - 32.0),
+                                0.0, 1.0);
+
+    // Per-band dead-zone relief factors for the transparent zero fill
+    // (--hf-zero-boost). Graded by the noise-fill weight so tonal bands get
+    // no relief (a lone |ix|=1 next to a coded tone is audible as noise) and
+    // the region boundary tapers smoothly instead of flickering. Transient
+    // and pre-window granules are never filled — extra HF right before an
+    // attack is exposed as pre-echo hiss.
+    std::array<double, NUM_SFB_LONG> zb_factor;
+    zb_factor.fill(1.0);
+    double zb_factor_hf = 1.0;   // implicit-sf0 region above the top SFB
+    if (s.cfg_hf_zero_boost_db > 0.0 && !granule_is_transient && !is_pre_window) {
+        // Up to 2x the configured relief window at 32 kbps (capped at the
+        // CLI's own 24 dB limit): the compressive curve then lifts deeper
+        // coefficients before its saturation cap kicks in.
+        const double zb_db =
+            std::min(s.cfg_hf_zero_boost_db * (1.0 + low_rate_t), 24.0);
+        for (int sfb = 0; sfb < NUM_SFB_LONG; ++sfb) {
+            const double w = noise_fill_weight(sfb, mt.tonality[sfb]);
+            if (w > 0.0)
+                zb_factor[sfb] = std::pow(10.0, zb_db * w / 20.0);
+        }
+        zb_factor_hf = std::pow(10.0, zb_db / 20.0);
+    }
+    // Flatten the zero-fill companding curve as the rate starves: exponent
+    // 1.0 (half-the-depth lift) at ≥128 kbps down to 0.5 at 32 kbps, so
+    // deep dead-zone coefficients still reach promotion. The per-band
+    // deficit budget continues to bound the total — the reach grows, the
+    // ceiling does not.
+    const double zb_fill_exp = 1.0 - 0.5 * low_rate_t;
 
     // Local mutable copies of weights and thresholds for fundamental and harmonic adjustments
     auto adj_weights = weights;
@@ -623,40 +742,59 @@ BeamResult beam_search(int max_bits, int* ix, int gr, int ch, EncoderState& s,
                             xrabs_bands[sfb], band_lens[sfb],
                             scalei_global, steptab_global,
                             sf, scale, preflag, sfb, s.int2idx,
-                            nsa);
+                            nsa, zb_factor[static_cast<std::size_t>(sfb)],
+                            zb_fill_exp);
                         if (!q.ok) continue;
 
                         // Active noise injection for noise-fill SFBs.
                         // Whenever the natural quantization zeroes the
                         // band, write a sparse ix=1 pattern so the
-                        // decoder synthesises noise targeting 30% of
-                        // max(E_band, Thr). Triggers both for "source
-                        // had content but quant gain too coarse" and
-                        // "source was quiet but threshold has room".
+                        // decoder synthesises noise at the source's own
+                        // band level. Fires only when the source had
+                        // content there — a band that was dark in the
+                        // source is not a hole and gets no fill.
                         const double nf_w = noise_fill_weight(sfb, mt.tonality[sfb]);
-                        if (nf_w > 0.0 && q.max_val == 0) {
+                        if (nf_w > 0.0 && q.max_val == 0
+                            && !granule_is_transient && !is_pre_window) {
                             // Seed the hole toward the source's own band level
-                            // (envelope-tracking) graded by nf_w, instead of a
-                            // flat 30 % — fills holes to a level that follows
-                            // the source spectral shape, and tapers to nothing
-                            // at the sfb/tonality boundaries (no seam).
-                            const double target_frac = (lo_hz >= 12000.0) ? 0.85 : 0.55;
-                            const double target_e =
-                                std::max(mt.thr[sfb], mt.e_band[sfb]) * (target_frac * nf_w);
+                            // (envelope-tracking) graded by nf_w. The budget is
+                            // the source band energy itself: the former aim of
+                            // max(Thr, E_band) filled *above* the source
+                            // whenever the threshold over-estimated, which is
+                            // exactly when the fill turns into audible extra
+                            // hiss. At or below the source level the fill is
+                            // indistinguishable from the content it replaces
+                            // while still closing the spectrogram hole.
+                            const double budget_e = mt.e_band[sfb] * nf_w;
+                            // Aim closer to the source level as the rate
+                            // starves (still bounded by budget_e).
+                            const double target_frac = std::min(0.97,
+                                ((lo_hz >= 12000.0) ? 0.90 : 0.60)
+                                + 0.10 * low_rate_t);
+                            const double target_e = budget_e * target_frac;
                             const double per_bin =
                                 q.dequant_factor * q.dequant_factor;
-                            // Relax the overshoot gate above 12 kHz to allow PNS-like noise injection 
-                            // even under coarser quantization (up to 1.8x overshoot).
-                            const bool can_inject = (lo_hz >= 12000.0)
-                                ? (per_bin <= target_e * 1.8)
-                                : (per_bin <= target_e);
+                            // A single coded bin may not exceed the band budget
+                            // by more than ~0.5 dB. Under a coarser gain the
+                            // fill would land louder than the source and read
+                            // as a boost — skip, and let a finer-gain candidate
+                            // do the filling instead. At starved rates the
+                            // allowance relaxes toward ~+2 dB: a slightly hot
+                            // fill beats a hole there.
+                            const bool can_inject =
+                                per_bin <= budget_e * (1.12 + 0.5 * low_rate_t);
                             if (per_bin > 0
                                 && can_inject
                                 && target_e > 0) {
                                 int n_target =
-                                    static_cast<int>(target_e / per_bin);
+                                    static_cast<int>(target_e / per_bin + 0.5);
                                 n_target = std::clamp(n_target,
                                                       1, band_lens[sfb]);
+                                // Trim so the injected total never exceeds the
+                                // source band energy.
+                                while (n_target > 1
+                                       && n_target * per_bin > budget_e)
+                                    --n_target;
                                 const int stride_inj = std::max(1,
                                     band_lens[sfb] / n_target);
                                 for (int pos = stride_inj / 2;
@@ -865,7 +1003,9 @@ BeamResult beam_search(int max_bits, int* ix, int gr, int ch, EncoderState& s,
                 }
                 auto q = quantize_band(xrabs_bands[sfb], band_lens[sfb],
                                        scalei_g, steptab_g, sf_val, scale,
-                                       preflag, sfb, s.int2idx, nsa);
+                                       preflag, sfb, s.int2idx, nsa,
+                                       zb_factor[static_cast<std::size_t>(sfb)],
+                                       zb_fill_exp);
                 if (!q.ok) { band_ok = false; break; }
                 const int start = band_table[sfb];
                 for (int j = 0; j < band_lens[sfb]; ++j)
@@ -903,7 +1043,9 @@ BeamResult beam_search(int max_bits, int* ix, int gr, int ch, EncoderState& s,
 
             auto q = quantize_band(xrabs_bands[sfb], band_lens[sfb],
                                    scalei_global, steptab_global, sf_val,
-                                   scale, preflag, sfb, s.int2idx, nsa);
+                                   scale, preflag, sfb, s.int2idx, nsa,
+                                   zb_factor[static_cast<std::size_t>(sfb)],
+                                   zb_fill_exp);
             double E_recon = 0.0;
             const double D_raw = q.ok
                 ? band_distortion(xr_bands[sfb], q.ix, q.dequant_factor, &E_recon)
@@ -961,7 +1103,8 @@ BeamResult beam_search(int max_bits, int* ix, int gr, int ch, EncoderState& s,
                         xrabs_bands[sfb], band_lens[sfb],
                         scalei_global, steptab_global,
                         new_sf, best.scale, best.preflag, sfb, s.int2idx,
-                        nsa);
+                        nsa, zb_factor[static_cast<std::size_t>(sfb)],
+                        zb_fill_exp);
                     if (!q.ok) continue;
                     double new_E_recon = 0.0;
                     const double new_D_raw =
@@ -1050,7 +1193,8 @@ BeamResult beam_search(int max_bits, int* ix, int gr, int ch, EncoderState& s,
         auto q = quantize_band(s.xrabs.data() + hf_start, hf_end - hf_start,
                                scalei_global, steptab_global,
                                /*sf=*/0, best.scale, best.preflag,
-                               /*sfb=*/NUM_SFB_LONG, s.int2idx, nsa);
+                               /*sfb=*/NUM_SFB_LONG, s.int2idx, nsa,
+                               zb_factor_hf, zb_fill_exp);
         if (q.ok && q.max_val > 0) {
             for (int j = 0; j < hf_end - hf_start; ++j)
                 best.ix[static_cast<std::size_t>(hf_start + j)] =
@@ -1067,6 +1211,261 @@ BeamResult beam_search(int max_bits, int* ix, int gr, int ch, EncoderState& s,
                 for (int j = 0; j < hf_end - hf_start; ++j)
                     best.ix[static_cast<std::size_t>(hf_start + j)] = 0;
             }
+        }
+    }
+
+    // --- Temporal rounding polish (pre-echo shaping) ---
+    // MP3 has no TNS: quantization noise of a long-block granule spreads
+    // over the whole 36-sample (subband-time) MDCT window, and the part
+    // that lands *before* an attack decodes as pre-echo. One degree of
+    // freedom is still free after the beam has fixed gain/scalefactors:
+    // the rounding direction of each coefficient. Nearest rounding
+    // minimises spectral MSE; nudging selected coefficients by ±1
+    // quantization level re-phases the error waveform so it lands mostly
+    // *after* the attack, where forward masking hides it — a TNS-like
+    // temporal noise control that stays fully bitstream-compatible.
+    //
+    // Scope: granules whose MDCT window actually contains the attack, on a
+    // long-family window (bass-heavy hits kept long by the HF gate, or
+    // --no-short-blocks) — exactly where pre-echo is otherwise only
+    // mitigated by cost weighting.
+    //
+    // The gate's attack_sub_index is a raw-PCM position, but the MDCT sees
+    // the signal only after the 512-tap polyphase analysis (≈256-sample
+    // group delay = 8 subband-time samples). Correct for it — otherwise
+    // the protected region ends ~5.8 ms *before* the real attack and the
+    // shaping dumps error right into the most exposed pre-attack zone.
+    // With the correction, a late attack (sub-window 2) actually lands in
+    // the NEXT granule's window, so the spill-over case is handled by
+    // looking one granule (possibly one frame) back.
+    int tns_cut = -1;
+    {
+        constexpr int kPolyDelaySub = 8;   // 256 / 32 subband-time samples
+        const auto win_pos = [&](int sub) {
+            return 6 * sub + kPolyDelaySub;   // window offset past sample 18
+        };
+        if ((s.transient_flags[gr] || s.attack_from_silence_flags[gr])
+            && s.attack_sub_index[gr] >= 0) {
+            const int o = win_pos(s.attack_sub_index[gr]);
+            if (o < 18) tns_cut = 18 + o + 1;   // +1: safety margin
+        }
+        if (tns_cut < 0) {
+            bool prev_attack = false;
+            int  prev_sub    = -1;
+            if (gr > 0) {
+                prev_attack = s.transient_flags[gr - 1]
+                           || s.attack_from_silence_flags[gr - 1];
+                prev_sub = s.attack_sub_index[gr - 1];
+            } else {
+                prev_attack = s.prev_frame_attack;
+                prev_sub    = s.prev_frame_attack_sub;
+            }
+            if (prev_attack && prev_sub >= 0) {
+                const int o = win_pos(prev_sub);
+                if (o >= 18) tns_cut = std::min(35, o + 1);
+            }
+        }
+        if (std::getenv("RMPS_TNS_DEBUG"))
+            std::fprintf(stderr,
+                "[tns-gate] gr=%d ch=%d tr=%d afs=%d sub=%d prevfr(att=%d "
+                "sub=%d) bt=%d -> cut=%d\n",
+                gr, ch, (int)s.transient_flags[gr],
+                (int)s.attack_from_silence_flags[gr], s.attack_sub_index[gr],
+                (int)s.prev_frame_attack, s.prev_frame_attack_sub,
+                s.block_type[ch][gr], tns_cut);
+    }
+    if (tns_cut >= 0 && s.block_type[ch][gr] != BLOCK_SHORT
+        && !std::getenv("RMPS_NO_TNS")) {
+        constexpr double kPi = 3.14159265358979323846;
+        const int bt = s.block_type[ch][gr];
+        // 36x18 windowed synthesis basis for this granule's window shape:
+        // an error ΔX_m contributes ΔX_m · B[k][m] to subband-time sample k.
+        std::array<std::array<double, 18>, 36> B;
+        for (int k = 0; k < 36; ++k) {
+            double w;
+            if (bt == BLOCK_START) {
+                if      (k < 18) w = std::sin(kPi / 36.0 * (k + 0.5));
+                else if (k < 24) w = 1.0;
+                else if (k < 30) w = std::sin(kPi / 12.0 * (k - 18 + 0.5));
+                else             w = 0.0;
+            } else if (bt == BLOCK_STOP) {
+                if      (k <  6) w = 0.0;
+                else if (k < 12) w = std::sin(kPi / 12.0 * (k - 6 + 0.5));
+                else if (k < 18) w = 1.0;
+                else             w = std::sin(kPi / 36.0 * (k + 0.5));
+            } else {
+                w = std::sin(kPi / 36.0 * (k + 0.5));
+            }
+            for (int m = 0; m < 18; ++m)
+                B[k][m] = w * std::cos(kPi / 72.0 * (2.0 * k + 19.0)
+                                                  * (2.0 * m + 1.0));
+        }
+        // Pre-attack region: window samples [0, cut) — everything the
+        // window covers up to the (delay-corrected) attack. The 512-tap
+        // polyphase *synthesis* filter pre-rings each subband-time sample
+        // by up to 8 samples (≈5.8 ms), so error parked immediately after
+        // the attack still leaks back in front of it: only k ≳ cut+5 is a
+        // safe dump zone. Ramp the weight down across that guard span;
+        // beyond it forward masking hides the noise.
+        const int cut = tns_cut;
+        std::array<double, 36> W;
+        for (int k = 0; k < 36; ++k) {
+            if      (k < cut)     W[k] = 1.0;
+            else if (k < cut + 5) W[k] = 1.0 - 0.184 * (k - cut + 1);
+            else                  W[k] = 0.08;
+        }
+
+        // Per-coefficient dequant factor from the chosen gain/sf/scale.
+        std::array<double, GRANULE_SAMPLES> dq {};
+        {
+            const std::int64_t sg = s.steptabi[best.gain + 127];
+            for (int sfb = 0; sfb < NUM_SFB_LONG; ++sfb) {
+                const int eff_sf = best.sf[static_cast<std::size_t>(sfb)]
+                    + (best.preflag ? PRETAB[static_cast<std::size_t>(sfb)] : 0);
+                const double sf_mult = tables::pow2_half_tab[
+                    static_cast<std::size_t>((1 + best.scale) * eff_sf)];
+                const std::int64_t scalei = static_cast<std::int64_t>(
+                    static_cast<double>(sg) * sf_mult + 0.5);
+                const double d =
+                    (scalei > 0) ? 4294967296.0 / static_cast<double>(scalei) : 0.0;
+                for (int i = band_table[sfb]; i < band_table[sfb + 1]; ++i)
+                    dq[static_cast<std::size_t>(i)] = d;
+            }
+            const double d0 =
+                (sg > 0) ? 4294967296.0 / static_cast<double>(sg) : 0.0;
+            for (int i = band_table[NUM_SFB_LONG]; i < GRANULE_SAMPLES; ++i)
+                dq[static_cast<std::size_t>(i)] = d0;
+        }
+
+        const auto saved_ix = best.ix;
+        bool changed = false;
+        double dbg_J0 = 0.0, dbg_J1 = 0.0;
+        int dbg_flips = 0;
+        // Flip journal, in acceptance order (best dJ first within a pass) —
+        // lets the bit-budget repair below undo the least valuable flips
+        // instead of discarding the whole polish over a few bits.
+        std::array<std::pair<int, int>, 128> flip_log {};   // (index, old_v)
+        int n_flips = 0;
+        // Coefficients inside the <200 Hz bass-protection bands are never
+        // re-rounded: their waveform fidelity outranks temporal shaping.
+        // Everything above (including the rest of subband 0 — a kick's
+        // 200–700 Hz body is a major pre-echo contributor) is fair game.
+        int i_min = GRANULE_SAMPLES;
+        for (int sfb = 0; sfb < NUM_SFB_LONG; ++sfb) {
+            const double lo_hz = band_table[sfb] * s.wave.samplerate / 1152.0;
+            if (lo_hz >= 200.0) { i_min = band_table[sfb]; break; }
+        }
+        for (int sb = 0; sb < 32; ++sb) {
+            const int base = sb * 18;
+            std::array<double, 18> err {};
+            std::array<double, 36> t {};
+            double e_tot = 0.0;
+            bool any_coded = false;
+            for (int m = 0; m < 18; ++m) {
+                const int i = base + m;
+                const int v = best.ix[static_cast<std::size_t>(i)];
+                if (v > 0) any_coded = true;
+                const double x = static_cast<double>(s.xr[i]);
+                double xh = tables::pow43_tab[v] * dq[static_cast<std::size_t>(i)];
+                if (x < 0.0) xh = -xh;
+                err[static_cast<std::size_t>(m)] = xh - x;
+                e_tot += err[static_cast<std::size_t>(m)]
+                       * err[static_cast<std::size_t>(m)];
+            }
+            if (!any_coded || e_tot <= 0.0) continue;
+            for (int k = 0; k < 36; ++k) {
+                double acc = 0.0;
+                for (int m = 0; m < 18; ++m)
+                    acc += err[static_cast<std::size_t>(m)] * B[k][m];
+                t[static_cast<std::size_t>(k)] = acc;
+            }
+            for (int k = 0; k < 36; ++k)
+                dbg_J0 += W[k] * t[static_cast<std::size_t>(k)]
+                               * t[static_cast<std::size_t>(k)];
+            // Total (unweighted) error may grow while shaping — the excess
+            // lands post-attack under forward masking — but keep it bounded.
+            const double e_cap = e_tot * 4.0;
+            for (int pass = 0; pass < 2; ++pass) {
+                bool improved = false;
+                for (int m = 0; m < 18; ++m) {
+                    const int i = base + m;
+                    if (i < i_min) continue;  // <200 Hz protection bands
+                    const int v = best.ix[static_cast<std::size_t>(i)];
+                    // v==0 with a nonzero source coefficient may be promoted
+                    // to 1 (that moves the reconstruction TOWARD the source,
+                    // it doesn't fabricate content) — the dominant pre-echo
+                    // term is precisely the error of the zeroed lines, and
+                    // re-rounding only coded lines leaves it untouchable.
+                    if (v < 1 && s.xr[i] == 0) continue;
+                    const double sign = (s.xr[i] < 0) ? -1.0 : 1.0;
+                    for (int vd : {-1, +1}) {
+                        const int v2 = v + vd;
+                        if (v2 < 0 || v2 > 8191) continue;
+                        const double delta = sign
+                            * (tables::pow43_tab[v2] - tables::pow43_tab[v])
+                            * dq[static_cast<std::size_t>(i)];
+                        const double e_new =
+                            e_tot + delta * (2.0 * err[static_cast<std::size_t>(m)]
+                                             + delta);
+                        if (e_new > e_cap) continue;
+                        double dJ = 0.0;
+                        for (int k = 0; k < 36; ++k) {
+                            const double bk = B[k][m];
+                            dJ += W[k] * delta * bk
+                                * (2.0 * t[static_cast<std::size_t>(k)]
+                                   + delta * bk);
+                        }
+                        if (dJ >= 0.0) continue;
+                        for (int k = 0; k < 36; ++k)
+                            t[static_cast<std::size_t>(k)] += delta * B[k][m];
+                        err[static_cast<std::size_t>(m)] += delta;
+                        e_tot = e_new;
+                        if (n_flips < static_cast<int>(flip_log.size()))
+                            flip_log[static_cast<std::size_t>(n_flips++)] =
+                                {i, v};
+                        best.ix[static_cast<std::size_t>(i)] = v2;
+                        changed = true;
+                        improved = true;
+                        ++dbg_flips;
+                        break;
+                    }
+                }
+                if (!improved) break;
+            }
+            for (int k = 0; k < 36; ++k)
+                dbg_J1 += W[k] * t[static_cast<std::size_t>(k)]
+                               * t[static_cast<std::size_t>(k)];
+        }
+        if (changed) {
+            GrInfo pg {};
+            int pb = final_bits(best.ix.data(), pg, s);
+            // Bit-budget repair: undo flips from the tail (weakest gains)
+            // until the granule fits again, rather than losing the whole
+            // polish over a handful of bits.
+            while (pb > max_bits - best.part2_length && n_flips > 0) {
+                const auto [idx, old_v] =
+                    flip_log[static_cast<std::size_t>(--n_flips)];
+                best.ix[static_cast<std::size_t>(idx)] = old_v;
+                pb = final_bits(best.ix.data(), pg, s);
+            }
+            const bool fits = pb <= max_bits - best.part2_length;
+            if (std::getenv("RMPS_TNS_DEBUG"))
+                std::fprintf(stderr,
+                    "[tns] gr=%d ch=%d cut=%d flips=%d J %.3e->%.3e (%.1f%%) "
+                    "bits %d->%d budget %d %s\n",
+                    gr, ch, cut, dbg_flips, dbg_J0, dbg_J1,
+                    (dbg_J0 > 0) ? 100.0 * dbg_J1 / dbg_J0 : 0.0,
+                    best.bits, pb, max_bits - best.part2_length,
+                    fits ? "KEEP" : "REVERT");
+            if (fits) {
+                best.tmp_gi = pg;
+                best.bits   = pb;
+            } else {
+                best.ix = saved_ix;   // shaped rounding didn't fit: revert
+            }
+        } else if (std::getenv("RMPS_TNS_DEBUG")) {
+            std::fprintf(stderr, "[tns] gr=%d ch=%d cut=%d no-moves\n",
+                         gr, ch, cut);
         }
     }
 

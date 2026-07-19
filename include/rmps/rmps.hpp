@@ -37,6 +37,15 @@ public:
     /// Flush any pending bytes (call once at end of stream).
     std::span<const std::uint8_t> flush();
 
+    /// Finalized Xing ("Xing" for ABR/VBR, "Info" for CBR) tag frame with
+    /// frame count, byte count and a 100-point seek TOC. A same-sized
+    /// placeholder was already emitted at the very start of the stream;
+    /// after flush(), overwrite the first vbr_tag().size() bytes of a
+    /// seekable output with this span. Unseekable sinks (stdout) can skip
+    /// the rewrite and keep the placeholder. The span is owned by the
+    /// encoder; empty if no audio frames were produced.
+    std::span<const std::uint8_t> vbr_tag();
+
     /// Latest frame's stats. Valid after every encode() call.
     const FrameStats& last_frame_stats() const noexcept;
 

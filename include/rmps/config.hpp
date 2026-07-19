@@ -103,13 +103,16 @@ struct Config {
   /// Default 2.5 (strong HF preservation). Higher values bias toward HF.
   double hf_weight_boost = 2.5;
 
-  /// Gain boost factor applied directly to MDCT coefficients above the adaptive clamp frequency (4kHz-14kHz).
-  /// Values > 1.0 make high-frequency coefficients larger, preventing them
-  /// from being zeroed out during quantization. Default 1.0 (no boost).
-  double hf_gain_boost_14k = 1.0;
-
-  /// Boost in dB (0.0 to 24.0) applied to coefficients above the adaptive clamp frequency (4kHz-14kHz)
-  /// that would otherwise be quantized to 0. Default 4.0 (4dB).
+  /// Boost cap in dB (0.0 to 24.0) for the transparent zero fill
+  /// ("black-spot boost") in HF noise-like bands (≈5 kHz+). The fill is
+  /// compressive (level-dependent): a zeroed coefficient near the dead-zone
+  /// boundary is kept at ≈0 dB lift, a quieter one is lifted by half its
+  /// depth in dB, saturating at this cap — so low-level detail is recovered
+  /// without uniform-gain over-fill. Realised as |ix|=1 promotions whose
+  /// density follows the curve; total energy is capped at the band's actual
+  /// deficit and disabled on transient/pre-echo granules, so it closes
+  /// spectral holes without ever reading as an HF boost. 0 disables.
+  /// Default 4.0.
   double hf_zero_boost_db = 4.0;
 
   /// Waveform preservation regularization strength in [0..1.0].

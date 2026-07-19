@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 
@@ -67,6 +68,78 @@ struct Encoder::Impl {
     std::vector<std::uint8_t>  last_output;
     FrameStats                 last_stats;
     std::unique_ptr<control::AbrController> abr;
+
+    // ----- Xing/Info (VBR) tag -----
+    std::vector<std::uint32_t> frame_sizes;   ///< bytes per produced frame
+    std::vector<std::uint8_t>  tag_frame;
+    bool tag_prepended = false;
+
+    /// Build the Xing ("Xing" for ABR, "Info" for CBR) tag frame. With
+    /// `final_pass` false this is the zero-count placeholder emitted at
+    /// stream start; with true it carries the real frame/byte counts and
+    /// the 100-point seek TOC. Both passes produce the same frame size,
+    /// so the finalized tag can overwrite the placeholder in place.
+    void build_vbr_tag(bool final_pass) {
+        const int sr         = state.wave.samplerate;
+        const int side_bytes = state.sideinfo_len / 8;   // incl. 4-byte header
+        const int need       = side_bytes + 120;         // magic..TOC..quality
+        int bi = -1, fsize = 0;
+        for (int i = 1; i < tables::NUM_BITRATES - 1; ++i) {
+            const int br = tables::bitrates[i][state.mpeg.version];
+            if (br < 0) continue;
+            const int sz = 144 * br * 1000 / sr;
+            if (sz >= need) { bi = i; fsize = sz; break; }
+        }
+        if (bi < 0) { tag_frame.clear(); return; }
+
+        tag_frame.assign(static_cast<std::size_t>(fsize), 0u);
+        const auto& m = state.mpeg;
+        tag_frame[0] = 0xFF;
+        tag_frame[1] = static_cast<std::uint8_t>(
+            0xE0 | (m.version << 3) | (m.layer << 1) | (m.crc ? 0 : 1));
+        tag_frame[2] = static_cast<std::uint8_t>(
+            (bi << 4) | ((m.samplerate_index % 3) << 2) | (m.ext));
+        tag_frame[3] = static_cast<std::uint8_t>(
+            (static_cast<int>(m.mode) << 6) | (m.mode_ext << 4)
+            | ((m.copyright ? 1 : 0) << 3) | ((m.original ? 1 : 0) << 2)
+            | static_cast<int>(m.emph));
+
+        std::size_t p = static_cast<std::size_t>(side_bytes);
+        const char* magic = abr ? "Xing" : "Info";
+        std::memcpy(tag_frame.data() + p, magic, 4); p += 4;
+        auto put_be32 = [&](std::uint32_t v) {
+            tag_frame[p++] = static_cast<std::uint8_t>(v >> 24);
+            tag_frame[p++] = static_cast<std::uint8_t>(v >> 16);
+            tag_frame[p++] = static_cast<std::uint8_t>(v >> 8);
+            tag_frame[p++] = static_cast<std::uint8_t>(v);
+        };
+        put_be32(0x00000007u);   // FRAMES | BYTES | TOC
+        if (!final_pass) return; // counts and TOC stay zero in the placeholder
+
+        std::uint64_t audio_bytes = 0;
+        for (const auto fs : frame_sizes) audio_bytes += fs;
+        const std::uint64_t total_bytes = audio_bytes + tag_frame.size();
+        const std::uint32_t n_frames =
+            static_cast<std::uint32_t>(frame_sizes.size());
+        put_be32(n_frames);
+        put_be32(static_cast<std::uint32_t>(total_bytes));
+
+        // TOC: byte offset (scaled to 0..255 of the whole file) at each
+        // percent of stream time. Frames are equal-duration, so percent of
+        // time == percent of frame index.
+        std::vector<std::uint64_t> cum(frame_sizes.size() + 1, 0);
+        for (std::size_t i = 0; i < frame_sizes.size(); ++i)
+            cum[i + 1] = cum[i] + frame_sizes[i];
+        for (int t = 0; t < 100; ++t) {
+            const std::size_t idx =
+                (static_cast<std::size_t>(t) * frame_sizes.size()) / 100;
+            const std::uint64_t off = tag_frame.size() + cum[idx];
+            std::uint64_t v = (total_bytes > 0)
+                ? (off * 256u) / total_bytes : 0u;
+            if (v > 255u) v = 255u;
+            tag_frame[p++] = static_cast<std::uint8_t>(v);
+        }
+    }
     Config                     cfg;
 
     bool init(const Config& c) {
@@ -134,6 +207,7 @@ struct Encoder::Impl {
         state.cfg_lf_strict_cutoff_hz = c.lf_strict_cutoff_hz;
         state.pre_gain          = std::pow(10.0, c.pre_gain_db / 20.0);
         state.hf_weight_boost   = std::max(1.0, c.hf_weight_boost);
+        state.cfg_hf_zero_boost_db = std::clamp(c.hf_zero_boost_db, 0.0, 24.0);
         state.cfg_noise_shaping_alpha = std::clamp(c.noise_shaping_alpha, 0.0, 0.95);
         state.cfg_waveform_reg  = c.waveform_reg;
         state.cfg_adaptive_ms   = c.adaptive_joint_stereo;
@@ -142,14 +216,14 @@ struct Encoder::Impl {
         state.prev_block_type   = {BLOCK_LONG, BLOCK_LONG};
         state.transient_gate.set_hf_transient_threshold(c.short_block_hf_threshold);
 
-        // The bit reservoir is now realised by the cross-frame main_data_begin
-        // mechanism in l3_bitstream + the frame_pool seed in iteration_loop
-        // (state.resv_bytes carries spare main_data across frames). The legacy
-        // ResvMax/ResvSize path in reservoir.cpp is left disabled to avoid
-        // double-counting: max_reservoir_bits returns the equal base share
-        // (mean_bits/channels) and the reservoir is layered on top by the
-        // frame_pool seed.
-        state.ResvMax  = 0;
+        // Cross-frame bit reservoir (main_data_begin). ResvSize/ResvMax plan
+        // the banking (reservoir::adjust / frame_end keep everything above
+        // ResvMax stuffed and the bank byte-aligned); l3_bitstream carries
+        // the authoritative BYTE accounting at emission. The cap must stay
+        // under the main_data_begin field range (511 bytes MPEG-1, 255
+        // MPEG-2) with margin.
+        state.ResvMax  = (ver == 3) ? 8 * 440 : 8 * 200;
+        if (std::getenv("RMPS_NO_RESV")) state.ResvMax = 0;  // diagnostic
         state.ResvSize = 0;
         // Reset the cross-frame reservoir/FIFO state for this stream.
         state.md_fifo.clear();
@@ -196,6 +270,15 @@ struct Encoder::Impl {
         bool any_transient = false;
         bool any_afs       = false;
         bool all_silent    = true;
+        // Capture the previous frame's last-granule attack info before
+        // analyse_frame overwrites the flag arrays (see EncoderState).
+        {
+            const int lastg = state.mpeg.granules_per_frame - 1;
+            state.prev_frame_attack =
+                state.transient_flags[lastg]
+                || state.attack_from_silence_flags[lastg];
+            state.prev_frame_attack_sub = state.attack_sub_index[lastg];
+        }
         if (state.buffer[0]) {
             state.transient_gate.analyse_frame(
                 state.buffer[0],
@@ -263,6 +346,19 @@ struct Encoder::Impl {
                            state.bs.data() + state.bs.byte_position());
         state.bs.consume_position();
 
+        // Xing/Info tag bookkeeping: every produced frame is exactly
+        // bits_per_frame long once emitted (reservoir emission only lags,
+        // it never resizes), so the size list drives both the frame count
+        // and the seek TOC. The placeholder leads the very first output.
+        frame_sizes.push_back(
+            static_cast<std::uint32_t>(state.mpeg.bits_per_frame / 8));
+        if (!tag_prepended) {
+            build_vbr_tag(/*final_pass=*/false);
+            last_output.insert(last_output.begin(),
+                               tag_frame.begin(), tag_frame.end());
+            tag_prepended = true;
+        }
+
         // Build FrameStats from state.
         last_stats = {};
         last_stats.granules         = state.frame_granule_stats;
@@ -303,8 +399,10 @@ struct Encoder::Impl {
                 static_cast<double>(samples_per_pass()) / state.wave.samplerate;
             std::optional<double> sdr;
             if (state.frame_granule_count > 0) sdr = last_stats.mean_perc_sdr_db;
-            abr->observe(static_cast<int>(last_output.size() * 8u),
-                         frame_seconds, sdr);
+            // Feed the PRODUCED frame size, not the emitted byte count:
+            // reservoir emission is lagged (a banking frame emits nothing,
+            // a later one emits several), which would whipsaw the PID.
+            abr->observe(state.mpeg.bits_per_frame, frame_seconds, sdr);
         }
     }
 };
@@ -336,8 +434,21 @@ std::span<const std::uint8_t> Encoder::encode(PcmChunk pcm) {
 }
 
 std::span<const std::uint8_t> Encoder::flush() {
-    impl_->last_output.clear();
-    return std::span<const std::uint8_t>(impl_->last_output.data(), 0u);
+    // Emit frames still waiting on future main data (reservoir tail).
+    l3::flush_bitstream(impl_->state);
+    impl_->last_output.assign(
+        impl_->state.bs.data(),
+        impl_->state.bs.data() + impl_->state.bs.byte_position());
+    impl_->state.bs.consume_position();
+    return std::span<const std::uint8_t>(impl_->last_output.data(),
+                                         impl_->last_output.size());
+}
+
+std::span<const std::uint8_t> Encoder::vbr_tag() {
+    if (impl_->frame_sizes.empty()) return {};
+    impl_->build_vbr_tag(/*final_pass=*/true);
+    return std::span<const std::uint8_t>(impl_->tag_frame.data(),
+                                         impl_->tag_frame.size());
 }
 
 const FrameStats& Encoder::last_frame_stats() const noexcept {

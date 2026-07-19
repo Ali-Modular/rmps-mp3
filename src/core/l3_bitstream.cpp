@@ -6,6 +6,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 
 namespace rmps::l3 {
 
@@ -231,17 +232,84 @@ void format_bitstream(EncoderState& s) {
         }
     }
 
-    // Self-contained per-frame emission (main_data_begin = 0). The cross-frame
-    // reservoir was removed: it corrupted decoded audio because the
-    // main_data_begin byte accounting could drift, and the encoder's internal
-    // quantization is already excellent without it.
-    encode_side_info(s, s.bs, /*main_data_begin=*/0);
-    encode_main_data(s, s.bs);
+    // ---- Cross-frame bit-reservoir emission (main_data_begin) ----
+    // Each frame contributes a fixed slot area (bits_per_frame minus
+    // header+side info) to a shared main_data byte stream. A frame whose
+    // main_data is shorter than its slots leaves the remainder to FUTURE
+    // frames, which reach back into it via main_data_begin. This converts
+    // the stuffing that quiet frames used to emit into bit savings an
+    // attack frame can draw down (reservoir::frame_end caps the bank at
+    // ResvMax and keeps it byte-aligned).
+    //
+    // Accounting is done here in BYTES from the actually-produced main
+    // data, never from the planner's ResvSize, so the emitted
+    // main_data_begin can not drift from the true stream layout (the
+    // failure mode that killed the earlier reservoir attempt).
+    const int slot_bytes =
+        s.mpeg.bits_per_frame / 8 - s.sideinfo_len / 8;
+
+    // resv_bytes = unfilled slot bytes of already-produced frames; that is
+    // exactly where this frame's main_data starts, i.e. main_data_begin.
+    if (s.resv_bytes < 0 || s.resv_bytes > 511) {
+        std::fprintf(stderr,
+                     "rmps: reservoir accounting out of range (%d bytes) — "
+                     "clamping; stream may glitch\n", s.resv_bytes);
+        s.resv_bytes = s.resv_bytes < 0 ? 0 : 511;
+    }
+    Bitstream head(128);
+    encode_side_info(s, head, /*main_data_begin=*/s.resv_bytes);
+    head.flush_bytes();          // header+side info is a whole byte count
+
+    Bitstream md(8192);
+    encode_main_data(s, md);
+    if (md.bit_count() % 8 != 0) {
+        // reservoir::frame_end keeps every frame's main_data byte-aligned;
+        // reaching this means a part2_3_length accounting bug upstream.
+        std::fprintf(stderr, "rmps: main_data not byte-aligned (%zu bits)\n",
+                     md.bit_count());
+        md.putbits(0, static_cast<int>(8 - md.bit_count() % 8));
+    }
+    md.flush_bytes();
+    const int md_bytes = static_cast<int>(md.byte_position());
+
+    s.pending_frames.push_back(
+        {std::vector<std::uint8_t>(head.data(),
+                                   head.data() + head.byte_position()),
+         slot_bytes});
+    s.md_fifo.insert(s.md_fifo.end(), md.data(), md.data() + md.byte_position());
+    s.resv_bytes += slot_bytes - md_bytes;
+
+    // Emit every pending frame whose slot area the fifo can already fill.
+    // A frame that banked bits waits until later frames produce the main
+    // data that occupies its tail slots.
+    while (!s.pending_frames.empty()
+           && s.md_fifo.size() >=
+                  static_cast<std::size_t>(s.pending_frames.front().slot)) {
+        const auto& pf = s.pending_frames.front();
+        for (const auto b : pf.head) s.bs.putbits(b, 8);
+        for (int i = 0; i < pf.slot; ++i)
+            s.bs.putbits(s.md_fifo[static_cast<std::size_t>(i)], 8);
+        s.md_fifo.erase(s.md_fifo.begin(), s.md_fifo.begin() + pf.slot);
+        s.pending_frames.erase(s.pending_frames.begin());
+    }
+    s.bs.flush_bytes();
 }
 
 void flush_bitstream(EncoderState& s) {
-    // No buffered frames in the self-contained emission model.
-    (void)s;
+    // Stream end: no more main data is coming, so zero-pad the fifo far
+    // enough to serve every still-pending frame's slot area.
+    while (!s.pending_frames.empty()) {
+        const auto pf = s.pending_frames.front();
+        s.pending_frames.erase(s.pending_frames.begin());
+        if (s.md_fifo.size() < static_cast<std::size_t>(pf.slot))
+            s.md_fifo.resize(static_cast<std::size_t>(pf.slot), 0u);
+        for (const auto b : pf.head) s.bs.putbits(b, 8);
+        for (int i = 0; i < pf.slot; ++i)
+            s.bs.putbits(s.md_fifo[static_cast<std::size_t>(i)], 8);
+        s.md_fifo.erase(s.md_fifo.begin(), s.md_fifo.begin() + pf.slot);
+    }
+    s.bs.flush_bytes();
+    s.resv_bytes = 0;
 }
 
 } // namespace rmps::l3

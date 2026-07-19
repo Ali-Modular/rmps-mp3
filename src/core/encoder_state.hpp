@@ -181,6 +181,20 @@ struct EncoderState {
   /// encoded). This flag tells the masking model to inject an artificial
   /// low threshold into the history so the post-mask carry bleeds into
   /// the current frame's thresholds — an approximate retroactive fix.
+  /// Last granule of the PREVIOUS frame carried an attack (captured in
+  /// encoder.cpp BEFORE analyse_frame overwrites the flag arrays —
+  /// transient_gate.prev_frame_last_decision() is already rewritten to the
+  /// current frame by encode time, so it cannot serve this purpose).
+  /// A sub-window-2 attack lands, after the polyphase delay, inside the
+  /// NEXT frame's gr0 MDCT window; beam_search's temporal shaping and the
+  /// iteration_loop attack surge both need to know.
+  bool prev_frame_attack     = false;
+  int  prev_frame_attack_sub = -1;
+  /// Per-granule multiplier on mask_params.lambda_R, set by iteration_loop
+  /// before each quantizer call. Couples the bit-reservoir state into the
+  /// beam search's rate-distortion cost: <1 on attack granules (spend the
+  /// bank), >1 when the bank is lean (refill it).
+  double lambda_granule_scale = 1.0;
   bool cross_frame_pre_window = false;
   /// Energy contrast of the cross-frame boundary (current gr=0 attack
   /// vs previous frame's last sub-window).
@@ -211,6 +225,13 @@ struct EncoderState {
   /// Multiplier on the perceptual weight for HF SFBs (17–20). > 1
   /// forces the cost function to spend more bits on hi-hat sizzle.
   double hf_weight_boost = 1.0;
+  /// Boost cap in dB for the transparent zero fill ("black-spot boost",
+  /// CLI --hf-zero-boost). Compressive law: zeroed coefficients near the
+  /// dead-zone boundary get ≈0 dB lift, quieter ones half their depth in
+  /// dB, saturating at this cap; realised as |ix|=1 promotions whose
+  /// density follows the curve, energy-capped at the band's actual
+  /// deficit so it cannot read as an HF boost. 0 = disabled.
+  double cfg_hf_zero_boost_db = 0.0;
   /// 1st-order error-feedback noise-shaping coefficient used by the
   /// per-band shaping quantizer (0..0.95). 0 = no shaping. Sourced from
   /// Config::noise_shaping_alpha (CLI --shaping); default 0.5.

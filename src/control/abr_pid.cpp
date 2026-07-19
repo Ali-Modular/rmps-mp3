@@ -3,6 +3,7 @@
 #include "core/tables.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 
 namespace rmps::control {

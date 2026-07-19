@@ -39,7 +39,6 @@ struct CliOpts {
     std::optional<double> hf_weight_boost;
     std::optional<double> lf_strict_db;
     std::optional<double> waveform_reg;
-    std::optional<double> hf_gain_boost_14k;
     std::optional<double> hf_zero_boost_db;
     std::optional<int>    effort;
     std::optional<std::string> pid;
@@ -77,10 +76,10 @@ void usage(std::FILE* out) {
         "                          structural +~2 dB shift in the pipeline). [-2.0]\n"
         "      --hf-boost N        per-band weight multiplier for SFB 17–20\n"
         "                          (~7–16 kHz). >1 preserves hi-hat sizzle. [2.5]\n"
-        "      --hf-gain-boost N   coefficient gain boost multiplier for MDCT\n"
-        "                          coefficients above the adaptive clamp (4–14kHz). [1.0]\n"
-        "      --hf-zero-boost DB  boost in dB for coefficients above the adaptive clamp\n"
-        "                          (4–14kHz) that would be quantized to 0 (max 24.0). [4.0]\n"
+        "      --hf-zero-boost DB  boost cap in dB for the compressive zero fill in HF\n"
+        "                          (≈5 kHz+) noise bands: near-boundary coefficients get\n"
+        "                          ~0 dB lift, quieter ones up to DB; energy-capped at\n"
+        "                          the source level. 0=off (max 24.0). [4.0]\n"
         "      --lf-strict DB      lower the masking threshold below 1 kHz by DB,\n"
         "                          spending more bits on clean bass. 0=off. [10]\n"
         "      --waveform-reg VAL  waveform preservation regularization in [0..1.0]. [0.05]\n"
@@ -126,7 +125,6 @@ int parse_args(int argc, char** argv, CliOpts& opts) {
         else if (a == "--shaping")          { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.shaping = d; ++i; }
         else if (a == "--pre-gain")         { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.pre_gain_db = d; ++i; }
         else if (a == "--hf-boost")         { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.hf_weight_boost = d; ++i; }
-        else if (a == "--hf-gain-boost")    { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.hf_gain_boost_14k = d; ++i; }
         else if (a == "--hf-zero-boost")     { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.hf_zero_boost_db = d; ++i; }
         else if (a == "--lf-strict")        { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.lf_strict_db = d; ++i; }
         else if (a == "--waveform-reg")     { auto v = need(i); if (!v) return 2; double d; if (!parse_double(v, d)) return 2; opts.waveform_reg = d; ++i; }
@@ -158,6 +156,17 @@ struct OutSink {
                                   static_cast<std::streamsize>(n));
     }
     void flush() { if (is_stdout) std::cout.flush(); else file.flush(); }
+
+    /// Overwrite the first n bytes (the Xing/Info tag placeholder) after the
+    /// stream is complete. Not possible on stdout — the placeholder stays.
+    bool rewrite_start(const std::uint8_t* data, std::size_t n) {
+        if (is_stdout) return false;
+        file.seekp(0);
+        file.write(reinterpret_cast<const char*>(data),
+                   static_cast<std::streamsize>(n));
+        file.flush();
+        return file.good();
+    }
 };
 
 std::unique_ptr<OutSink> open_output(const std::string& path) {
@@ -251,7 +260,6 @@ int main(int argc, char** argv) {
         std::clamp(*opts.shaping, 0.0, 0.95);
     if (opts.pre_gain_db)   ccfg.pre_gain_db = *opts.pre_gain_db;
     if (opts.hf_weight_boost) ccfg.hf_weight_boost = *opts.hf_weight_boost;
-    if (opts.hf_gain_boost_14k) ccfg.hf_gain_boost_14k = *opts.hf_gain_boost_14k;
     if (opts.hf_zero_boost_db)  ccfg.hf_zero_boost_db  = *opts.hf_zero_boost_db;
     if (opts.lf_strict_db)    ccfg.lf_strict_db    = *opts.lf_strict_db;
     if (opts.waveform_reg)    ccfg.waveform_reg    = *opts.waveform_reg;
@@ -330,6 +338,11 @@ int main(int argc, char** argv) {
         sink->flush();
         bytes_out += flushed.size();
     }
+
+    // Finalize the Xing/Info tag: real frame/byte counts + seek TOC over
+    // the placeholder emitted at stream start (skipped for stdout).
+    auto tag = encoder->vbr_tag();
+    if (!tag.empty()) sink->rewrite_start(tag.data(), tag.size());
 
     const double elapsed_s =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

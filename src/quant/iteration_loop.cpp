@@ -232,7 +232,10 @@ void iteration_loop(EncoderState &s) {
 
       int pruned_width_side = 0;
       int pruned_width_mid = 0;
-      for (int sfb = 0; sfb < NUM_SFB_LONG; ++sfb) {
+      // sfb 0 (the lowest band, DC–~170 Hz) is never pruned in either
+      // channel: zeroing the fundamental is audible as a bass dropout no
+      // matter what the masking model claims about it.
+      for (int sfb = 1; sfb < NUM_SFB_LONG; ++sfb) {
         const double e_s = mt_side.e_band[sfb];
         const double e_m = mt_mid.e_band[sfb];
         const double thr_s = mt_side.thr[sfb];
@@ -321,6 +324,73 @@ void iteration_loop(EncoderState &s) {
   // converts would-be stuffing into coded precision.
   int frame_pool_bits = 0;
 
+  // --- Attack surge ---------------------------------------------------
+  // Pre-echo scales directly with the attack granule's quantization step:
+  // measured on silence→burst material, 128k→320k lowers the decoded
+  // pre-attack noise floor by ~10 dB, dwarfing every window-domain trick.
+  // So shift budget *within the frame* toward the granule that carries
+  // the attack, funded by its sibling. The donation is graded by how
+  // expendable the sibling is: a silent or pre-window granule (quiet by
+  // definition — it precedes the strike) gives up half its share, a
+  // normal granule a quarter. Total frame bits are unchanged, so this is
+  // CBR-safe; the ABR transient hint stacks on top for ABR mode.
+  double gr_bias[MAX_GRANULES] = {1.0, 1.0};
+  if (s.mpeg.granules_per_frame == 2) {
+    // A sub-window-2 attack at the end of the previous frame lands (after
+    // the polyphase delay) inside THIS frame's gr0 MDCT window — treat
+    // gr0 as attack-bearing so its quantization step, which decodes into
+    // the pre-attack region, gets the surge too.
+    const bool spill0 =
+        s.prev_frame_attack && s.prev_frame_attack_sub >= 2;
+    const auto has_attack = [&](int g) {
+      return s.transient_flags[g] || s.attack_from_silence_flags[g]
+          || (g == 0 && spill0);
+    };
+    if (std::getenv("RMPS_NO_SURGE")) {
+      // diagnostic kill switch: flat shares
+    } else
+    for (int g = 0; g < 2; ++g) {
+      const int sib = 1 - g;
+      if (has_attack(g) && !has_attack(sib)) {
+        const bool sib_quiet =
+            s.silent_flags[sib] || s.pre_window_flags[sib];
+        const double surge = sib_quiet ? 0.50 : 0.25;
+        gr_bias[g]   = 1.0 + surge;
+        gr_bias[sib] = 1.0 - surge;
+      }
+    }
+  }
+
+  // --- Cross-frame reservoir draw --------------------------------------
+  // Quiet frames bank their slack (reservoir::frame_end keeps up to
+  // ResvMax un-stuffed; l3_bitstream realises it via main_data_begin).
+  // Spend the bank where it buys the most: granules carrying an attack.
+  // Draw at most 70% per frame so consecutive attacks each get a share,
+  // and never plan below zero — reservoir::adjust subtracts actual spend.
+  int resv_draw_per_slot = 0;
+  {
+    int n_att_slots = 0;
+    if (s.mpeg.granules_per_frame == 2) {
+      const bool spill0 =
+          s.prev_frame_attack && s.prev_frame_attack_sub >= 2;
+      for (int g = 0; g < 2; ++g)
+        if (s.transient_flags[g] || s.attack_from_silence_flags[g]
+            || (g == 0 && spill0))
+          n_att_slots += s.wave.channels;
+    }
+    if (n_att_slots > 0 && s.ResvSize > 0)
+      resv_draw_per_slot = ((s.ResvSize * 7) / 10) / n_att_slots;
+  }
+
+  // --- Reservoir-pressure λ coupling ------------------------------------
+  // The beam's cost is perceptual + λ_R·bits, so λ is the natural knob to
+  // integrate the reservoir state into the search itself: an attack
+  // granule searches with a lower λ (bits are cheap — the bank pays),
+  // while a lean bank raises λ everywhere so quiet frames re-fill it.
+  const double resv_fill = (s.ResvMax > 0)
+      ? std::clamp(static_cast<double>(s.ResvSize) / s.ResvMax, 0.0, 1.0)
+      : 0.0;
+
   for (int ch = 0; ch < s.wave.channels; ++ch) {
     for (auto &v : s.side_info.scfsi[ch])
       v = 0;
@@ -349,6 +419,19 @@ void iteration_loop(EncoderState &s) {
       // frames and large for attack frames. No further per-granule
       // budget shaping needed here.
       int max_bits = reservoir::max_reservoir_bits(s.pe[ch][gr], s);
+      max_bits = std::clamp(
+          static_cast<int>(max_bits * gr_bias[gr]), 0, 4095);
+      const bool slot_has_attack =
+          s.transient_flags[gr] || s.attack_from_silence_flags[gr]
+          || (gr == 0 && s.prev_frame_attack && s.prev_frame_attack_sub >= 2);
+      if (slot_has_attack && resv_draw_per_slot > 0
+          && !std::getenv("RMPS_NO_DRAW"))
+        max_bits = std::min(max_bits + resv_draw_per_slot, 4095);
+      // Reservoir-pressure λ for this granule's search: attack granules
+      // buy bits cheap; a lean bank makes everyone frugal so it refills.
+      s.lambda_granule_scale = std::getenv("RMPS_NO_LAMBDA")
+          ? 1.0
+          : (slot_has_attack ? 0.6 : 1.0 + 0.3 * (1.0 - resv_fill));
       if (ms_xfer[gr] > 0) {
         if (ch == 0)
           max_bits += ms_xfer[gr]; // Mid gains
