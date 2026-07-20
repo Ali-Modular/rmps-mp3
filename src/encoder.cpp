@@ -203,6 +203,13 @@ struct Encoder::Impl {
 
         state.cfg_mask_alpha    = c.mask_alpha;
         state.cfg_mask_lambda_R = c.mask_lambda_R;
+        // Temporary tuning overrides (killer-sample fitting). Read once at
+        // init; unset in production. Let the optimizer sweep the two cost
+        // knobs and the MS weights without a rebuild per trial.
+        if (const char* e = std::getenv("RMPS_FIT_MALPHA"))
+            state.cfg_mask_alpha = std::atof(e);
+        if (const char* e = std::getenv("RMPS_FIT_MLAMBDA"))
+            state.cfg_mask_lambda_R = std::atof(e);
         state.cfg_lf_strict_db        = c.lf_strict_db;
         state.cfg_lf_strict_cutoff_hz = c.lf_strict_cutoff_hz;
         state.pre_gain          = std::pow(10.0, c.pre_gain_db / 20.0);
@@ -223,7 +230,6 @@ struct Encoder::Impl {
         // under the main_data_begin field range (511 bytes MPEG-1, 255
         // MPEG-2) with margin.
         state.ResvMax  = (ver == 3) ? 8 * 440 : 8 * 200;
-        if (std::getenv("RMPS_NO_RESV")) state.ResvMax = 0;  // diagnostic
         state.ResvSize = 0;
         // Reset the cross-frame reservoir/FIFO state for this stream.
         state.md_fifo.clear();

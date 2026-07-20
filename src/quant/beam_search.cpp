@@ -1274,8 +1274,7 @@ BeamResult beam_search(int max_bits, int* ix, int gr, int ch, EncoderState& s,
                 (int)s.prev_frame_attack, s.prev_frame_attack_sub,
                 s.block_type[ch][gr], tns_cut);
     }
-    if (tns_cut >= 0 && s.block_type[ch][gr] != BLOCK_SHORT
-        && !std::getenv("RMPS_NO_TNS")) {
+    if (tns_cut >= 0 && s.block_type[ch][gr] != BLOCK_SHORT) {
         constexpr double kPi = 3.14159265358979323846;
         const int bt = s.block_type[ch][gr];
         // 36x18 windowed synthesis basis for this granule's window shape:

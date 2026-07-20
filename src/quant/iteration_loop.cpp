@@ -183,11 +183,12 @@ void iteration_loop(EncoderState &s) {
     if (cutoff < s.wave.samplerate * 0.5 - 1.0) {
       for (int ch = 0; ch < s.wave.channels; ++ch) {
         // M channel (ch 0) keeps a slightly wider band than S so the
-        // attack's body still has spectral content; S is killed more
-        // aggressively (stereo side is least audible during a strike).
+        // attack's body still has spectral content; S is trimmed a little
+        // more (the stereo side is less exposed during a strike) but not
+        // slammed — an over-narrow Side collapses the image at every hit.
         const double ch_cutoff = (ch == 0 && s.wave.channels == 2)
                                      ? std::min(cutoff * 1.4, 22050.0)
-                                     : cutoff;
+                                     : std::min(cutoff * 1.15, 22050.0);
         apply_transient_cutoff(s, ch, gr, ch_cutoff);
       }
     }
@@ -241,13 +242,17 @@ void iteration_loop(EncoderState &s) {
         const double thr_s = mt_side.thr[sfb];
         const double thr_m = mt_mid.thr[sfb];
 
-        // Symmetric candidates for pruning
-        // Relaxed pruning thresholds to preserve more stereo details (weaker
-        // pruning)
+        // Asymmetric pruning. Mid carries the mono/dominant content and is
+        // pruned on the original (loose) rule. Side carries the stereo
+        // image: zeroing a Side band collapses the image there, which is
+        // audible on wide material even when the band sits below its own
+        // masking threshold. So Side is pruned only when it is genuinely
+        // negligible — below its own threshold AND tiny relative to Mid —
+        // not merely below the (often generous) Mid threshold.
         const bool prune_mid_cand =
             (e_m <= thr_m * 0.5) || (e_m <= thr_s * 0.5) || (e_m < 0.01 * e_s);
         const bool prune_side_cand =
-            (e_s <= thr_s * 0.5) || (e_s <= thr_m * 0.5) || (e_s < 0.01 * e_m);
+            (e_s <= thr_s * 0.35) && (e_s < 0.004 * e_m);
 
         bool prune_mid = false;
         bool prune_side = false;
@@ -346,9 +351,6 @@ void iteration_loop(EncoderState &s) {
       return s.transient_flags[g] || s.attack_from_silence_flags[g]
           || (g == 0 && spill0);
     };
-    if (std::getenv("RMPS_NO_SURGE")) {
-      // diagnostic kill switch: flat shares
-    } else
     for (int g = 0; g < 2; ++g) {
       const int sib = 1 - g;
       if (has_attack(g) && !has_attack(sib)) {
@@ -378,8 +380,13 @@ void iteration_loop(EncoderState &s) {
             || (g == 0 && spill0))
           n_att_slots += s.wave.channels;
     }
-    if (n_att_slots > 0 && s.ResvSize > 0)
-      resv_draw_per_slot = ((s.ResvSize * 7) / 10) / n_att_slots;
+    // Only draw against the bitrate-tapered bank: below 96 kbps the bank is
+    // shrunk toward zero (reservoir::effective_resv_max) to stop the bass
+    // pumping, so the attack draw must respect the same limit.
+    const int eff_bank =
+        std::min(s.ResvSize, reservoir::effective_resv_max(s));
+    if (n_att_slots > 0 && eff_bank > 0)
+      resv_draw_per_slot = ((eff_bank * 7) / 10) / n_att_slots;
   }
 
   // --- Reservoir-pressure λ coupling ------------------------------------
@@ -387,9 +394,10 @@ void iteration_loop(EncoderState &s) {
   // integrate the reservoir state into the search itself: an attack
   // granule searches with a lower λ (bits are cheap — the bank pays),
   // while a lean bank raises λ everywhere so quiet frames re-fill it.
-  const double resv_fill = (s.ResvMax > 0)
-      ? std::clamp(static_cast<double>(s.ResvSize) / s.ResvMax, 0.0, 1.0)
-      : 0.0;
+  const int eff_resv_max = reservoir::effective_resv_max(s);
+  const double resv_fill = (eff_resv_max > 0)
+      ? std::clamp(static_cast<double>(s.ResvSize) / eff_resv_max, 0.0, 1.0)
+      : 1.0;  // no bank to refill (low rate) → no λ penalty
 
   for (int ch = 0; ch < s.wave.channels; ++ch) {
     for (auto &v : s.side_info.scfsi[ch])
@@ -424,14 +432,12 @@ void iteration_loop(EncoderState &s) {
       const bool slot_has_attack =
           s.transient_flags[gr] || s.attack_from_silence_flags[gr]
           || (gr == 0 && s.prev_frame_attack && s.prev_frame_attack_sub >= 2);
-      if (slot_has_attack && resv_draw_per_slot > 0
-          && !std::getenv("RMPS_NO_DRAW"))
+      if (slot_has_attack && resv_draw_per_slot > 0)
         max_bits = std::min(max_bits + resv_draw_per_slot, 4095);
       // Reservoir-pressure λ for this granule's search: attack granules
       // buy bits cheap; a lean bank makes everyone frugal so it refills.
-      s.lambda_granule_scale = std::getenv("RMPS_NO_LAMBDA")
-          ? 1.0
-          : (slot_has_attack ? 0.6 : 1.0 + 0.3 * (1.0 - resv_fill));
+      s.lambda_granule_scale =
+          slot_has_attack ? 0.6 : 1.0 + 0.3 * (1.0 - resv_fill);
       if (ms_xfer[gr] > 0) {
         if (ch == 0)
           max_bits += ms_xfer[gr]; // Mid gains
