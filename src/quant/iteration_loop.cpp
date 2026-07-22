@@ -141,6 +141,21 @@ void apply_peak_valley_zeroing(EncoderState &s) {
         local_max[i] = mx;
       }
 
+      // Masking budget per scalefactor band: the total energy this pass may
+      // remove from a band and still stay inaudible is its masking threshold
+      // (thr already folds in the ATH floor). Zeroing a valley bin injects
+      // its own power as error, so accumulate per band and stop once the
+      // budget is spent — the removed spectrum is then provably below the
+      // mask. This keeps the noise-floor cleanup (which frees bits on dense
+      // material) while refusing to cut audible tonal detail. A 0.5 margin
+      // holds the aggregate ~3 dB under the threshold.
+      const auto &band_table =
+          tables::scale_fact_band_index[s.mpeg.samplerate_index];
+      const auto &thr = s.mask_thresholds[ch][gr].thr;
+      constexpr double PVZ_MASK_MARGIN = 0.5;
+      std::array<double, NUM_SFB_LONG> removed{};
+      int cur_sfb = 0;
+
       // 4. Zero out valleys between peaks (above 1 kHz, i.e., bin 26)
       for (int i = 26; i < GRANULE_SAMPLES; ++i) {
         double threshold = 0.06;
@@ -160,7 +175,17 @@ void apply_peak_valley_zeroing(EncoderState &s) {
         }
 
         if (mag[i] < local_max[i] * threshold) {
-          arr[i] = 0;
+          // Advance the current band and only zero while the band's masking
+          // budget has room — otherwise the removed content would rise above
+          // the threshold and become audible.
+          while (cur_sfb < NUM_SFB_LONG - 1 && i >= band_table[cur_sfb + 1])
+            ++cur_sfb;
+          const double p = mag[i] * mag[i];
+          const double budget = thr[cur_sfb] * PVZ_MASK_MARGIN;
+          if (removed[cur_sfb] + p <= budget) {
+            arr[i] = 0;
+            removed[cur_sfb] += p;
+          }
         }
       }
     }
@@ -174,7 +199,6 @@ void iteration_loop(EncoderState &s) {
   post::apply_ms_stereo(s);
   s.hf_adaptor_apply();
   post::apply_lowpass(s);
-  apply_peak_valley_zeroing(s);
 
   // Per-granule transient cutoff (kicks pre-echo mitigation): applied to
   // every channel of any granule the gate flagged.
@@ -215,6 +239,12 @@ void iteration_loop(EncoderState &s) {
     }
   }
 
+  // Peak/valley noise-floor cleanup — now that masking thresholds exist, it
+  // only removes valley content that stays under the per-band mask (see the
+  // function). Runs after the thresholds so its gate is psychoacoustic, not a
+  // raw magnitude ratio, and before quantization so the beam sees the result.
+  apply_peak_valley_zeroing(s);
+
   // --- Masking-based Mid/Side channel band disabling & budget reallocation ---
   int ms_xfer[MAX_GRANULES] = {0};
   if (s.wave.channels == 2 && (s.mpeg.mode_ext & 2) && s.mpeg.bitr <= 128) {
@@ -242,17 +272,22 @@ void iteration_loop(EncoderState &s) {
         const double thr_s = mt_side.thr[sfb];
         const double thr_m = mt_mid.thr[sfb];
 
-        // Asymmetric pruning. Mid carries the mono/dominant content and is
-        // pruned on the original (loose) rule. Side carries the stereo
-        // image: zeroing a Side band collapses the image there, which is
-        // audible on wide material even when the band sits below its own
-        // masking threshold. So Side is pruned only when it is genuinely
-        // negligible — below its own threshold AND tiny relative to Mid —
-        // not merely below the (often generous) Mid threshold.
-        const bool prune_mid_cand =
-            (e_m <= thr_m * 0.5) || (e_m <= thr_s * 0.5) || (e_m < 0.01 * e_s);
-        const bool prune_side_cand =
-            (e_s <= thr_s * 0.35) && (e_s < 0.004 * e_m);
+        // Prune a band ONLY when its own energy sits safely below its own
+        // masking threshold — thr already folds in the ATH floor, so a band
+        // with e_band ≤ thr injects (when zeroed) an error that is below both
+        // the mask and absolute audibility. A −6 dB margin keeps it strictly
+        // inaudible even if the model over-estimates masking.
+        //
+        // The former cross-channel term (compare a channel's energy to the
+        // OTHER channel's threshold) and relative-energy term (prune when one
+        // channel is merely much quieter than the other) are removed: neither
+        // has a psychoacoustic basis and both cut audible content whenever the
+        // opposite channel happened to be louder. This makes pruning minimal
+        // and provably sub-threshold — quantization noise is left to the beam,
+        // whose NMR cost already holds it under the same mask.
+        constexpr double PRUNE_SUBMASK = 0.25;   // −6 dB below the mask
+        const bool prune_mid_cand  = (e_m <= thr_m * PRUNE_SUBMASK);
+        const bool prune_side_cand = (e_s <= thr_s * PRUNE_SUBMASK);
 
         bool prune_mid = false;
         bool prune_side = false;
@@ -363,6 +398,19 @@ void iteration_loop(EncoderState &s) {
     }
   }
 
+  // --- Reconcile the planner bank with the emitted bank ----------------
+  // The planner's ResvSize (bits) and the bitstream's authoritative
+  // s.resv_bytes (bytes, updated at emission) track the same physical
+  // reservoir, but the emission rounds each frame's main_data UP to a whole
+  // byte, so it banks slightly less than the planner each frame. Left
+  // unchecked that drift lets an attack granule draw more bits than are
+  // actually in the stream, driving main_data_begin negative in
+  // l3_bitstream (clamped there to 0 → a corrupted, glitchy frame — audible
+  // at 88–112 kbps where the reservoir is partially active). Clamp the
+  // planner to the real byte bank so a draw can never exceed it.
+  if (s.ResvSize > s.resv_bytes * 8)
+    s.ResvSize = s.resv_bytes * 8;
+
   // --- Cross-frame reservoir draw --------------------------------------
   // Quiet frames bank their slack (reservoir::frame_end keeps up to
   // ResvMax un-stuffed; l3_bitstream realises it via main_data_begin).
@@ -398,6 +446,22 @@ void iteration_loop(EncoderState &s) {
   const double resv_fill = (eff_resv_max > 0)
       ? std::clamp(static_cast<double>(s.ResvSize) / eff_resv_max, 0.0, 1.0)
       : 1.0;  // no bank to refill (low rate) → no λ penalty
+
+  // --- Hard frame main-data cap (bitstream feasibility) ----------------
+  // The whole frame's main_data (every granule/channel) must physically fit
+  // in this frame's slot plus what is ACTUALLY banked in the stream
+  // (s.resv_bytes). Per-granule reservoir grants, the attack draw, and the
+  // black-spot / <200 Hz guards can each individually exceed the advisory
+  // budget; unchecked their sum overruns the bank and drives main_data_begin
+  // negative in l3_bitstream (clamped to 0 → glitch, seen at 88–112 kbps).
+  // Cap the cumulative production so that can never happen. The margin
+  // (bytes) absorbs the per-frame byte-rounding of main_data plus the small,
+  // budget-ignoring guard overruns, keeping resv_bytes ≥ 0 with headroom.
+  constexpr int RESV_CAP_MARGIN_BITS = 8 * 8;   // 8 bytes
+  const int slot_bits = s.mpeg.bits_per_frame - s.sideinfo_len;
+  const int frame_hard_bits =
+      std::max(0, slot_bits + s.resv_bytes * 8 - RESV_CAP_MARGIN_BITS);
+  int frame_md_used = 0;
 
   for (int ch = 0; ch < s.wave.channels; ++ch) {
     for (auto &v : s.side_info.scfsi[ch])
@@ -451,6 +515,10 @@ void iteration_loop(EncoderState &s) {
       const int base_grant = max_bits;
       max_bits = std::min(base_grant + frame_pool_bits, 4095);
       frame_pool_bits -= (max_bits - base_grant);
+
+      // Hard cap: never let the running frame total exceed what the slot +
+      // real reservoir can physically hold (see frame_hard_bits above).
+      max_bits = std::min(max_bits, std::max(0, frame_hard_bits - frame_md_used));
 
       for (auto &v : s.scalefactor.l[gr][ch])
         v = 0;
@@ -659,6 +727,8 @@ void iteration_loop(EncoderState &s) {
       // (clamped at 0: the black-spot guard may exceed the advisory
       // budget by a few count1 bits, which the frame slack absorbs).
       frame_pool_bits += std::max(0, max_bits - gi.part2_3_length);
+      // Track the running frame main-data total for the hard cap above.
+      frame_md_used += gi.part2_3_length;
       reservoir::adjust(gi, s);
       gi.global_gain = gi.quantizerStepSize + 210;
     }

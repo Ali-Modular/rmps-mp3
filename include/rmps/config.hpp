@@ -64,7 +64,7 @@ struct Config {
   int beam_width = -1;
   int gain_window = -1; ///< ±N around bin-search seed
   int sf_max_candidate = -1;
-  double noise_shaping_alpha = 0.25; ///< 0..0.95
+  double noise_shaping_alpha = 0.3; ///< 0..0.95 (killer-sample fit 2026-07-20)
   double hf_max_atten_m_db = 0.0;    ///< HFAdaptor cap (M)
   double hf_max_atten_s_db = 1.0;    ///< HFAdaptor cap (S)
 
@@ -74,7 +74,7 @@ struct Config {
   /// 0.0 = legacy SDR (safe default during model bring-up).
   /// 0.3 = NMR-assisted, SDR-dominant (recommended starter).
   /// 1.0 = pure NMR.
-  double mask_alpha = 0.3;
+  double mask_alpha = 0.45;  ///< killer-sample fit 2026-07-20 (was 0.3)
   /// Override for the per-band RDO Lagrange multiplier λ_R in the
   /// beam-search cost. Negative = auto-derive from bitrate (default).
   double mask_lambda_R = -1.0;
@@ -84,7 +84,7 @@ struct Config {
   /// to spend more bits keeping the bass clean. Applied *after* the ATH
   /// floor, so it may demand precision below absolute audibility. Default
   /// 10 dB (strong, bass-favouring); set to 0.0 to disable.
-  double lf_strict_db = 6.0;
+  double lf_strict_db = 18.0;  ///< killer-sample fit 2026-07-20 (was 6.0)
   /// Upper edge (Hz) of the LF strictness region. The effect is full below
   /// this and tapers off over ~1 Bark above it. Default 1 kHz.
   double lf_strict_cutoff_hz = 200.0;
@@ -101,7 +101,7 @@ struct Config {
   /// force the beam-search to spend more bits preserving HF noise
   /// (hi-hat sizzle, cymbal shimmer), at the cost of LF/mid SDR.
   /// Default 2.5 (strong HF preservation). Higher values bias toward HF.
-  double hf_weight_boost = 2.5;
+  double hf_weight_boost = 3.5;  ///< killer-sample fit 2026-07-20 (was 2.5)
 
   /// Boost cap in dB (0.0 to 24.0) for the transparent zero fill
   /// ("black-spot boost") in HF noise-like bands (≈5 kHz+). The fill is
@@ -113,12 +113,12 @@ struct Config {
   /// deficit and disabled on transient/pre-echo granules, so it closes
   /// spectral holes without ever reading as an HF boost. 0 disables.
   /// Default 4.0.
-  double hf_zero_boost_db = 4.0;
+  double hf_zero_boost_db = 8.0;  ///< killer-sample fit 2026-07-20 (was 4.0)
 
   /// Waveform preservation regularization strength in [0..1.0].
   /// Penalizes raw distortion independently of psychoacoustic masking
   /// thresholds, preserving overall waveform shape. Default 0.05.
-  double waveform_reg = 0.2;
+  double waveform_reg = 0.05;  ///< killer-sample fit 2026-07-20 (was 0.2)
 
   // --- PID gains override ---
   std::optional<double> abr_kp{};
