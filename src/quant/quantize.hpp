@@ -22,6 +22,17 @@ void subdivide        (GrInfo& gi, EncoderState& s);
 /// addresses and table_select into `gi` and returns the big-values bit count.
 /// Strictly never produces more bits than the fixed-table subdivide() path.
 int  best_subdivide_rd(int* ix, GrInfo& gi, EncoderState& s);
+/// RD-optimal big_values / count1 boundary, on top of `best_subdivide_rd`.
+///
+/// `calc_runlen` makes the count1 region as long as the |ix| <= 1 run allows
+/// and calls it done. That is a greedy choice, and the region split underneath
+/// it is not: moving the boundary up by one quadruple hands four coefficients
+/// back to big_values, which changes both the count1 cost and the whole
+/// (region0, region1, table) assignment `best_subdivide_rd` then solves for.
+/// Searches the greedy boundary and a few quadruples either side of it, leaves
+/// `gi` holding the winner, and returns count1 + big-values bits. Never worse
+/// than the greedy split, since that is one of the candidates.
+int  best_runlen_rd   (int* ix, GrInfo& gi, EncoderState& s);
 void bigv_tab_select  (int* ix, GrInfo& gi);
 int  bigv_bitcount    (int* ix, const GrInfo& gi);
 int  count_bit        (int* ix, int start, int end, int table);

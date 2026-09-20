@@ -17,6 +17,15 @@ constexpr double PI72 = PI / 72.0;
 constexpr double PI12 = PI / 12.0;
 constexpr double PI6  = PI / 6.0;
 
+// Table generation only, at init: these define the fixed-point constants the
+// rest of the encoder is calibrated against, so they keep the historical
+// wrapping cast on purpose. One of them does wrap, and the whole model is
+// tuned around the value it produces — switching these to `fx::sat32` with
+// everything else measured *worse* (the kick-fidelity gain from the xrsq fix
+// was cancelled: sd 1.07 -> 1.63, worst-case level -2.6 dB -> -11.5 dB on a
+// real program). These are deterministic constants, not program-dependent
+// arithmetic, so unlike the stores in the signal path they cannot produce a
+// material-dependent artefact. Leave them.
 inline std::int32_t to_q31(double v) {
   return fx::i32(static_cast<std::int64_t>(v * static_cast<double>(0x7fffffff)));
 }
@@ -81,8 +90,8 @@ inline void cmuls(std::int32_t a_re, std::int32_t a_im, std::int32_t b_re,
   const std::int64_t tim = (static_cast<std::int64_t>(a_re) * b_im +
                             static_cast<std::int64_t>(a_im) * b_re) >>
                            31;
-  d_re = fx::i32(tre);
-  d_im = fx::i32(tim);
+  d_re = fx::sat32(tre);
+  d_im = fx::sat32(tim);
 }
 
 } // namespace
@@ -177,7 +186,7 @@ void analyse(EncoderState &s, int stride) {
               for (int n = 0; n < 12; ++n) {
                 acc += static_cast<std::int64_t>(sub[n]) * cos_k[n];
               }
-              natural[band * 18 + w * 6 + k] = fx::i32((acc * 3) >> 32);
+              natural[band * 18 + w * 6 + k] = fx::sat32((acc * 3) >> 32);
             }
           }
         }
@@ -196,13 +205,35 @@ void analyse(EncoderState &s, int stride) {
             mdct_in[k + 18] = s.l3_sb_sample[ch][gr + 1][k][band];
           }
           for (int k = 0; k < K_PER_GRANULE; ++k) {
-            std::int32_t vm = 0;
+            // Accumulate the 36-tap sum in full precision and convert once,
+            // the same way the short transform above already did.
+            //
+            // This used to run the accumulator in int32 and saturate on every
+            // term: `vm = sat32(vm + fx::mul(...))`. Each term is a Q31
+            // product bounded by 2^30, so a 36-term sum reaches 2^35 — the
+            // *partial* sums routinely exceed int32 even when the final
+            // coefficient does not, and every excursion past the limit was
+            // clamped and lost. Saturation is not recoverable: later terms of
+            // the opposite sign bring the running value back down, but the
+            // clipped magnitude never returns.
+            //
+            // It only bites when the input is loud enough to push a partial
+            // sum over, which is why it read as an occasional thump on peaks
+            // rather than as steady distortion, and why it was audible at
+            // 320 kbps — it happens before quantization, so no bitrate can
+            // outrun it. Measured on real material at 320 kbps: the six worst
+            // frames all sat at 0.93-0.99 full scale and carried -9 dB of
+            // error, which is a third of the signal amplitude.
+            //
+            // Summing the raw products also drops 35 of the 36 roundings that
+            // `fx::mul`'s per-term truncation was accumulating as bias.
+            std::int64_t acc = 0;
             const auto &cos_k = cos_tab[k];
             for (int j = 0; j < 36; ++j) {
-              vm = fx::i32(static_cast<std::int64_t>(vm) +
-                           fx::mul(mdct_in[j], cos_k[j]));
+              acc += static_cast<std::int64_t>(mdct_in[j]) *
+                     static_cast<std::int64_t>(cos_k[j]);
             }
-            s.mdct_freq[ch][gr][band * 18 + k] = vm;
+            s.mdct_freq[ch][gr][band * 18 + k] = fx::sat32(acc >> 32);
           }
 
           // Anti-aliasing butterfly (except for band 0).
@@ -210,6 +241,13 @@ void analyse(EncoderState &s, int stride) {
             for (int i = 0; i < 8; ++i) {
               const int idx_curr = band * 18 + i;
               const int idx_prev = (band - 1) * 18 + (17 - i);
+              // Alias reduction. The sign convention here was
+              // challenged and measured: negating ca (so the cross terms
+              // match the textbook ISO forward butterfly) made things
+              // *worse* — 1 kHz sine 20.9 -> 18.8 dB, real material
+              // 14.0 -> 11.2 — so the arrangement below is the one that
+              // pairs correctly with the decoder. Do not "fix" it again
+              // without measuring an actual decode.
               std::int32_t dre, dim;
               cmuls(s.mdct_freq[ch][gr][idx_curr], s.mdct_freq[ch][gr][idx_prev],
                     g_cs[i], g_ca[i], dre, dim);

@@ -4,13 +4,54 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace rmps::post {
 
 namespace {
 constexpr double TRANSIENT_RATIO   = 4.0;
-constexpr double TRANSIENT_BIAS_DB = 4.0;
 constexpr double BIT_PRESSURE_KNEE = 0.85;
+
+/// Extra HF attenuation applied *on* a transient frame.
+///
+/// This is the wrong sign for brightness. The attenuation lands on the frame
+/// the attack is in — a cymbal or hat loses its top exactly as it strikes —
+/// and is then released over the following frames through the EMA below, so
+/// the brightness arrives late instead. Reported audibly as the high end
+/// lagging behind the music.
+///
+/// Note the cap it runs into: `hf_max_atten_m_db` is 0, so this only ever
+/// attenuates *Side*. It is therefore not pre-echo control (pre-echo is a
+/// Mid-dominated phenomenon and this would not touch it) — it is a bit-saving
+/// measure that pays for itself by narrowing the stereo image at the top,
+/// exactly on the attacks where the top matters most. Now 0 by default.
+///
+/// The eval harness cannot see this: on the synthetic testset the adaptor
+/// never winds past its 0.3 dB engage threshold, so every metric reads
+/// identical. On real material it engages at both 56 and 128 kbps (verified
+/// by hash). This default is a reasoned change, not a measured one.
+double transient_bias_db() {
+    if (const char *e = std::getenv("RMPS_HF_TBIAS")) {
+        const double v = std::atof(e);
+        if (v >= 0.0) return v;
+    }
+    return 0.0;
+}
+
+/// Release rate of the attenuation, as a multiple of the attack rate.
+///
+/// `observe` is pure feedback: the attenuation applied to frame N comes from
+/// frame N-1's statistics, smoothed. Winding *up* slowly is right — it keeps
+/// the loop from chasing single frames. Winding *down* slowly is not: it is
+/// what holds the high end suppressed after the passage that justified it has
+/// passed. 1.0 is the symmetric EMA this replaced.
+double release_ratio() {
+    if (const char *e = std::getenv("RMPS_HF_RELEASE")) {
+        const double v = std::atof(e);
+        if (v >= 1.0) return v;
+    }
+    return 2.0;
+}
 }
 
 HFAdaptor::HFAdaptor(double shelf_hz, double max_m, double max_s,
@@ -37,7 +78,8 @@ void HFAdaptor::apply(EncoderState& s) {
     transient_   = ratio > TRANSIENT_RATIO;
     prev_energy_ = 0.7 * prev_energy_ + 0.3 * e;
 
-    const double atten_db = cur_atten_db_ + (transient_ ? TRANSIENT_BIAS_DB : 0.0);
+    static const double t_bias = transient_bias_db();
+    const double atten_db = cur_atten_db_ + (transient_ ? t_bias : 0.0);
     last_total_atten_db_  = atten_db;
     if (atten_db < 0.3) return;
 
@@ -57,7 +99,7 @@ void HFAdaptor::apply(EncoderState& s) {
         for (int gr = 0; gr < s.mpeg.granules_per_frame; ++gr) {
             auto& arr = s.mdct_freq[ch][gr];
             for (int i = shelf_bin; i < GRANULE_SAMPLES; ++i) {
-                arr[i] = fx::i32(static_cast<std::int64_t>(arr[i] * g));
+                arr[i] = fx::sat32(arr[i] * g);
             }
         }
     }
@@ -73,7 +115,11 @@ void HFAdaptor::observe(const FrameStats& fs) {
     const double bit_pressure = std::max(0.0, usage - BIT_PRESSURE_KNEE) * 30.0;
     double target = 0.7 * sdr_dev + bit_pressure;
     target = std::clamp(target, 0.0, max_atten_s_db_);
-    cur_atten_db_ = ema_alpha_ * target + (1.0 - ema_alpha_) * cur_atten_db_;
+    static const double rel = release_ratio();
+    const double alpha = (target < cur_atten_db_)
+                             ? std::min(1.0, ema_alpha_ * rel)
+                             : ema_alpha_;
+    cur_atten_db_ = alpha * target + (1.0 - alpha) * cur_atten_db_;
 }
 
 HFAdaptorState HFAdaptor::state() const noexcept {

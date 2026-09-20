@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace rmps::quant {
 
@@ -35,20 +37,45 @@ void initialise(EncoderState& s) {
     }
 }
 
+/// Scaled magnitude of `x` at this step size, in the `int2idx` domain.
+///
+/// Kept in 64-bit deliberately. The Q31 product `x · scalei` needs 63 bits
+/// before the shift, and `fx::mulr` returns it through `fx::i32`, which wraps —
+/// so a loud coefficient at a fine step came back as a small or *negative*
+/// number instead of a large one.
+inline std::int64_t scaled_mag(std::int32_t x, std::int32_t scalei) noexcept {
+    return (static_cast<std::int64_t>(x) * scalei +
+            static_cast<std::int64_t>(0x80000000LL)) >> 32;
+}
+
 int quantize(int* ix, int stepsize, EncoderState& s) {
     const std::int32_t scalei = s.steptabi[stepsize + 127];
-    if (fx::mulr(s.xrmax, scalei) > 165140) return 16384;
+
+    // Reject a step too fine for this granule. 165140 = 8191^(4/3), i.e. the
+    // largest magnitude the 8191-level codebook can express.
+    //
+    // This guard used to be written with `fx::mulr`, which wraps: for a loud
+    // granule and a fine step the true product overflowed int32 and came back
+    // small, so the guard passed a step size it should have rejected. The loop
+    // below then computed a *negative* `ln` the same way and read
+    // `int2idx[negative]` — an out-of-bounds access that crashed the encoder
+    // outright at `--effort 6`, where the search probes finer steps.
+    //
+    // It surfaced only after the M/S rotation was made saturating: before
+    // that, an overflowing coefficient wrapped to an arbitrary smaller value,
+    // so `xrmax` rarely sat at the top of the range. Saturation put it there
+    // reliably and exposed the latent bug underneath.
+    if (scaled_mag(s.xrmax, scalei) > 165140) return 16384;
 
     int max_val = 0;
     for (int i = 0; i < GRANULE_SAMPLES; ++i) {
-        const std::int32_t x = s.xrabs[i];
-        const std::int32_t ln = fx::mulr(x, scalei);
-        int v;
-        if (ln < 262144) {
-            v = s.int2idx[static_cast<std::size_t>(ln)];
-        } else {
-            v = 8191;
-        }
+        const std::int64_t ln = scaled_mag(s.xrabs[i], scalei);
+        // The guard above bounds `ln` at 165140, so this only ever picks the
+        // table. It stays as a hard bound because the cost of being wrong here
+        // is a wild read, not a wrong sample.
+        const int v = (ln >= 0 && ln < 262144)
+                          ? s.int2idx[static_cast<std::size_t>(ln)]
+                          : 8191;
         ix[i] = v;
         if (v > max_val) max_val = v;
     }
@@ -345,18 +372,28 @@ int best_subdivide_rd(int* ix, GrInfo& gi, EncoderState& s) {
             // (unreachable: tables 13/15 cover every value < 15)
         }
         // ESC path.
+        //
+        // Both escape families (16-23 and 24-31) share one code word set per
+        // family, so within a family the only thing that varies is `linbits`
+        // and more of it is strictly more bits. The best table in a family is
+        // therefore the *smallest* one that can still reach `lin_need`, which
+        // is what `linmax` (= 2^linbits − 1) tests directly.
+        //
+        // The 24-family counterpart used to be taken as `t1 + 8`, which is not
+        // that table: linbits run 1,2,3,4,6,8,10,13 in the 16-family against
+        // 4,5,6,7,8,9,11,13 in the 24-family, so +8 lands 1-3 bits per escape
+        // too wide for every t1 in 17..21 (e.g. t1=19 needs 4 and got 27's 7).
+        // That over-prices the 24-family alternative in this comparison — and
+        // when it wins anyway, the encoder really does write the extra bits.
         const int esc = pesc[b] - pesc[a];
         const int lin_need = (seg_max > 15) ? seg_max - 15 : 0;
-        int t1;
-        if (lin_need <= 1)         t1 = 16;
-        else if (lin_need <= 3)    t1 = 17;
-        else if (lin_need <= 7)    t1 = 18;
-        else if (lin_need <= 15)   t1 = 19;
-        else if (lin_need <= 63)   t1 = 20;
-        else if (lin_need <= 255)  t1 = 21;
-        else if (lin_need <= 1023) t1 = 22;
-        else                       t1 = 23;
-        const int t2 = t1 + 8;
+        auto smallest_for = [lin_need](int first, int last) {
+            for (int t = first; t < last; ++t)
+                if (huffman::at(t).linmax >= lin_need) return t;
+            return last;
+        };
+        const int t1 = smallest_for(16, 23);
+        const int t2 = smallest_for(24, 31);
         const int b1 = static_cast<int>(pb16[b] - pb16[a]) + esc * huffman::at(t1).linbits;
         const int b2 = static_cast<int>(pb24[b] - pb24[a]) + esc * huffman::at(t2).linbits;
         return (b2 < b1) ? Seg{t2, b2} : Seg{t1, b1};
@@ -470,6 +507,72 @@ int part2_length(int gr, int ch, EncoderState& s) {
     return bits;
 }
 
+/// How many quadruples either side of the greedy boundary to try.
+///
+/// The count1 region can only ever be *shortened* relative to the greedy
+/// answer — lengthening it is impossible, since `calc_runlen` already took the
+/// whole |ix| <= 1 run — so the search is one-sided, and each step hands four
+/// more coefficients to big_values.
+///
+/// 4 covers the useful range: the two costs differ by a handful of bits per
+/// quadruple, so a boundary that wants to move a long way would have to be
+/// wrong about every quadruple in between, which the greedy rule does not do.
+/// Sweepable with RMPS_RUNLEN_K; 0 reproduces the greedy split exactly.
+constexpr int RUNLEN_K_DEFAULT = 4;
+
+int best_runlen_rd(int* ix, GrInfo& gi, EncoderState& s) {
+    static const int K = [] {
+        if (const char* e = std::getenv("RMPS_RUNLEN_K")) {
+            const int v = std::atoi(e);
+            if (v >= 0 && v <= 32) return v;
+        }
+        return RUNLEN_K_DEFAULT;
+    }();
+
+    calc_runlen(ix, gi);
+    const int greedy_bigv   = gi.big_values;
+    const int greedy_count1 = gi.count1;
+
+    int best_bits = INT_MAX;
+    // The fields `count1_bitcount` and `best_subdivide_rd` write between them.
+    struct Split {
+        int big_values, count1, count1table_select;
+        int region0_count, region1_count;
+        int address1, address2, address3;
+        std::array<int, 3> table_select;
+    } best{};
+
+    const int kmax = std::min(K, greedy_count1);
+    for (int k = 0; k <= kmax; ++k) {
+        // Shorten count1 by k quadruples; those 2k pairs join big_values.
+        const int c1 = greedy_count1 - k;
+        const int bv = greedy_bigv + 2 * k;
+        // `big_values` is a 9-bit field and addresses 2*big_values
+        // coefficients, so it cannot exceed 288.
+        if (bv > 288) break;
+        gi.big_values = bv;
+        gi.count1     = c1;
+        const int bits = count1_bitcount(ix, gi) + best_subdivide_rd(ix, gi, s);
+        if (bits < best_bits) {
+            best_bits = bits;
+            best = {gi.big_values, gi.count1, gi.count1table_select,
+                    gi.region0_count, gi.region1_count,
+                    gi.address1, gi.address2, gi.address3, gi.table_select};
+        }
+    }
+
+    gi.big_values         = best.big_values;
+    gi.count1             = best.count1;
+    gi.count1table_select = best.count1table_select;
+    gi.region0_count      = best.region0_count;
+    gi.region1_count      = best.region1_count;
+    gi.address1           = best.address1;
+    gi.address2           = best.address2;
+    gi.address3           = best.address3;
+    gi.table_select       = best.table_select;
+    return best_bits;
+}
+
 int outer_loop(int max_bits, int* ix, int gr, int ch, EncoderState& s) {
     auto& gi = s.side_info.gr[gr].ch[ch].tt;
     gi.quantizerStepSize = bin_search_StepSize(max_bits, ix, gi, s);
@@ -479,10 +582,7 @@ int outer_loop(int max_bits, int* ix, int gr, int ch, EncoderState& s) {
     // Finalise with the RD-optimal region split. This recount also repairs
     // the run-length fields in the all-zero starvation path (inner_loop can
     // zero ix while gi still carries counts from a previous iteration).
-    calc_runlen(ix, gi);
-    int bits  = count1_bitcount(ix, gi);
-    bits     += best_subdivide_rd(ix, gi, s);
-    gi.part2_3_length = gi.part2_length + bits;
+    gi.part2_3_length = gi.part2_length + best_runlen_rd(ix, gi, s);
     return gi.part2_3_length;
 }
 

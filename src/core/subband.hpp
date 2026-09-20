@@ -16,5 +16,11 @@ void window_filter(int ch, int* out, EncoderState& s, int stride);
 /// Convenience overload with std::int32_t output.
 void window_filter(int ch, int* out, EncoderState& s);
 
+/// Print fixed-point headroom statistics for the analysis chain
+/// (RMPS_FX_PROBE): how often each conversion saturates and how far past the
+/// limit it reached.
+void fx_probe_report();
+
 } // namespace subband
+
 } // namespace rmps

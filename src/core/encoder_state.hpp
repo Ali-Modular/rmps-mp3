@@ -82,6 +82,52 @@ struct EncoderState {
              MAX_CHANNELS>
       l3_enc{};
 
+  // The previous granule's quantized indices, per channel, and whether they
+  // are usable. Only meaningful between two consecutive LONG granules: the
+  // short-block layout interleaves three sub-windows, so line i does not name
+  // the same frequency in both. Read by the quantizer's zero hysteresis.
+  std::array<std::array<int, GRANULE_SAMPLES>, MAX_CHANNELS> prev_l3_enc{};
+  std::array<bool, MAX_CHANNELS> prev_l3_enc_long{};
+  /// The stereo mode those indices were coded in. Channel 1 is Side under
+  /// M/S and Right under L/R, and `apply_ms_stereo` re-decides per frame, so
+  /// across a mode flip the two granules are not the same signal at all.
+  int prev_l3_enc_mode_ext = -1;
+  /// Source band energies of the previous granule, per channel — what the
+  /// band hole guard compares against to decide whether the source was steady.
+  /// Valid under the same conditions as `prev_l3_enc` (see prev_l3_enc_long).
+  std::array<std::array<double, NUM_SFB_LONG>, MAX_CHANNELS> prev_e_band{};
+  /// Reconstructed (decoded) band energies of the previous granule, per
+  /// channel, same units as `prev_e_band`. Zeroed at the start of every beam
+  /// search and written only when it succeeds, so a fallback granule leaves no
+  /// stale reference behind for the next granule's hole rescue.
+  std::array<std::array<double, NUM_SFB_LONG>, MAX_CHANNELS> prev_erec_band{};
+  /// Mid lowpass hold: the cutoff actually applied, and the run of frames the
+  /// scan has asked to move it in one direction (see hold_mid_cutoff).
+  double lpf_mid_applied_hz = -1.0;
+  int lpf_mid_pending_dir = 0;
+  int lpf_mid_pending_n = 0;
+  double lpf_mid_pending_hz = 0.0;
+  int lpf_mid_cut_age = 1 << 20;   ///< frames since the last applied cut
+  /// Hit / steady HF matching (see iteration_loop.cpp). A slow, power-
+  /// weighted average per channel and band of what the encoder reconstructs
+  /// (er) against what the source had (es), taken on steady long granules.
+  /// Their ratio is the coding gain steady material actually gets; zero until
+  /// measured, which means "no attenuation".
+  std::array<std::array<double, NUM_SFB_LONG>, MAX_CHANNELS> hf_steady_er{};
+  std::array<std::array<double, NUM_SFB_LONG>, MAX_CHANNELS> hf_steady_es{};
+  /// Granules since the last detected attack, and which granules of the frame
+  /// being coded fall inside a hit (the attack and the granules after it).
+  int granules_since_hit = 1 << 20;
+  std::array<bool, MAX_GRANULES> hit_window{};
+  /// Debug snapshot taken where beam_search fixes part2_3_length, compared
+  /// by the main-data writer: if the data or the run lengths change between
+  /// counting and writing, the side info is stale.
+  std::array<std::array<std::array<int, GRANULE_SAMPLES>, MAX_CHANNELS>,
+             MAX_GRANULES> dbg_fin_ix{};
+  std::array<std::array<int, MAX_CHANNELS>, MAX_GRANULES> dbg_fin_bigv{},
+      dbg_fin_count1{}, dbg_fin_p23{};
+  std::array<std::array<bool, MAX_CHANNELS>, MAX_GRANULES> dbg_fin_valid{};
+
   // Subband sample cache. [ch][gr_plus_1][k][band]
   std::array<
       std::array<std::array<std::array<std::int32_t, SUBBANDS>, K_PER_GRANULE>,
@@ -95,8 +141,18 @@ struct EncoderState {
       MAX_CHANNELS>
       mdct_freq{};
 
+  // Synthesized HF MDCT freq coefficients for bandwidth extension. [ch][gr][576]
+  std::array<
+      std::array<std::array<std::int32_t, GRANULE_SAMPLES>, MAX_GRANULES>,
+      MAX_CHANNELS>
+      mdct_freq_ext{};
+
   int ResvSize = 0;
   int ResvMax = 0;
+  /// Bits `reservoir::frame_end` discarded this frame because the bank was
+  /// already full — coded as stuffing, i.e. paid for in the stream and carrying
+  /// nothing. Excludes the 0-7 bits of byte alignment, which are unavoidable.
+  int frame_overflow_bits = 0;
 
   // ----- loop tables (initialised once) -----
   std::array<double, 256> steptab{};
@@ -171,6 +227,10 @@ struct EncoderState {
   /// Per-granule sub-window energies (3 × 192-sample windows per granule).
   /// Used by the masking model to estimate pre-echo exposure.
   std::array<std::array<double, 3>, MAX_GRANULES> sub_window_energies{};
+  /// Last sub-window energy of the previous frame's last granule, kept before
+  /// `sub_window_energies` is overwritten, so granule 0 can measure its rise
+  /// against what actually preceded it.
+  double prev_frame_last_sub_energy = 0.0;
   /// Sub-window index (0–2) where the attack fires, or -1 for no attack.
   std::array<int,    MAX_GRANULES> attack_sub_index{-1, -1};
   /// Energy contrast ratio (attack / preceding sub-window).
@@ -196,6 +256,49 @@ struct EncoderState {
   /// bank), >1 when the bank is lean (refill it).
   double lambda_granule_scale = 1.0;
   bool cross_frame_pre_window = false;
+
+  /// The encode's operating point in kbps, as opposed to this frame's rate.
+  ///
+  /// Every rate-keyed *policy* in the encoder — the Side lowpass, the M/S band
+  /// pruning, the masking alpha and lf_strict ramps, the reservoir taper, the
+  /// HF boost — was written against `mpeg.bitr`, which under CBR is the same
+  /// thing. Under quality-targeted VBR it is not: the rate swings 129-320 kbps
+  /// within a single 256 kbps encode (measured, 5 % of frames under 128), and
+  /// an easy frame that needed few bits was then coded with the *bandwidth and
+  /// stereo rules of a 128 kbps file*. That is what made quiet passages weak,
+  /// and it is why none of the rate-controller experiments moved them: the
+  /// controller was never the problem, the policies keyed to its output were.
+  ///
+  /// Set to max(this frame's rate, the controller's running average), so a
+  /// frame that got more bits than the encode's average still uses its own
+  /// richer policy, and one that got fewer is not demoted below the encode it
+  /// belongs to. Under CBR the two are equal and nothing changes.
+  double policy_kbps = 0.0;
+
+  /// `policy_kbps` as an int, falling back to the frame rate when no rate
+  /// controller is running. Use this for policy decisions; use `mpeg.bitr`
+  /// only where the actual bit budget of this frame is what matters.
+  int policy_bitr() const {
+    return (policy_kbps > 0.0) ? static_cast<int>(policy_kbps + 0.5)
+                               : mpeg.bitr;
+  }
+
+  // ----- One-frame lookahead (filled by Encoder::encode) -----
+  /// True when the frame after this one has already been seen. False on the
+  /// final frame, where there is nothing ahead to plan for.
+  /// Frame counter, for frame-scoped debug dumps only.
+  long long dbg_frame_no = 0;
+
+  bool lookahead_valid = false;
+  /// The next frame contains a sharp energy step — it will want bits.
+  bool lookahead_attack = false;
+  /// The next frame's attack lands in *its granule 0*. The START window that
+  /// must precede a SHORT belongs to the current frame, so without this the
+  /// block decision for such an attack is already too late — see
+  /// `decide_block_types`.
+  bool lookahead_attack_gr0 = false;
+  /// The next frame's energy relative to this one's, as an unbounded ratio.
+  double lookahead_demand = 0.0;
   /// Energy contrast of the cross-frame boundary (current gr=0 attack
   /// vs previous frame's last sub-window).
   double cross_frame_energy_contrast = 1.0;
@@ -239,6 +342,26 @@ struct EncoderState {
   /// Waveform preservation regularization strength (0..1.0).
   double cfg_waveform_reg = 0.05;
 
+  /// Mid/Side band attenuation bounds in dB (-6.0 to -36.0 dB) for NMR & rate optimization
+  double cfg_ms_atten_min_db = 6.0;
+  double cfg_ms_atten_max_db = 36.0;
+
+
+  // --- Search effort (Config::effort, CLI --effort; see encoder.cpp for the
+  // mapping). These were compile-time constants in beam_search.cpp, so
+  // `effort` and its explicit overrides did nothing at all. Every value below
+  // reproduces the old constant exactly at the default effort of 7.
+  /// ± window of global-gain candidates around the bin-search seed.
+  int cfg_gain_window = 4;
+  /// Highest per-band scalefactor the search may try (capped by slen too).
+  int cfg_sf_max = 5;
+  /// Terminal DP states that get a real `final_bits` count per configuration.
+  int cfg_rate_probes = 8;
+  /// Resolution of the DP's cumulative-rate axis.
+  int cfg_rate_buckets = 64;
+  /// Sweeps of the greedy ±1 scalefactor polish after the DP.
+  int cfg_polish_iters = 6;
+
   /// Adaptive joint-stereo: when true, the encoder decides per frame whether
   /// M/S coding actually compresses better than plain L/R and switches
   /// mode_ext accordingly (2 = MS on, 0 = MS off). Always-on MS wastes bits
@@ -248,6 +371,14 @@ struct EncoderState {
   /// at the decision boundary, which would otherwise modulate the stereo
   /// image frame-to-frame).
   bool ms_prev_frame = true;
+
+  // --- High-Frequency Extension ---
+  bool cfg_hf_extension = false;
+  double cfg_hf_ext_cutoff_hz = -1.0;
+  double cfg_hf_ext_obj_gain_db = 0.0;
+  double cfg_hf_ext_res_gain_db = -1.0;
+  double cfg_hf_ext_tilt_db_oct = 0.0;
+  int hf_cutoff_sfb = NUM_SFB_LONG;
 
   /// Snapshot of the last successfully-encoded granule per channel,
   /// used by the outer_loop fallback path to inherit SFs / compress /
@@ -271,6 +402,11 @@ struct EncoderState {
   double frame_raw_dist = 0.0;
   double frame_w_signal_pow = 0.0;
   double frame_w_dist = 0.0;
+  /// A-weighted "did not keep" and "invented" powers, summed over the frame.
+  /// The frame Fullness / Bleedless score is one ratio of these sums against
+  /// `frame_w_signal_pow`, not a mean of per-granule decibels.
+  double frame_w_def = 0.0;
+  double frame_w_exc = 0.0;
   int frame_granule_count = 0;
   int frame_total_bits = 0;
   int frame_total_budget = 0;

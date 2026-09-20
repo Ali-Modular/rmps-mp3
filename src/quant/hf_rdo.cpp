@@ -71,6 +71,9 @@ int hf_rdo(int* ix_full, int& cur_bits,
         if (tonality[sfb] < 0.30) {
             continue;
         }
+        if (s.cfg_hf_extension && sfb >= s.hf_cutoff_sfb) {
+            continue;
+        }
         cands.clear();
         // Effective shift = (sf + preflag*pretab) * (1+scale). We don't have sf
         // here — caller already produced ix using a given sf, so we re-derive

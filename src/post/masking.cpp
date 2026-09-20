@@ -1,9 +1,11 @@
 #include "post/masking.hpp"
 #include "core/encoder_state.hpp"
 #include "core/tables.hpp"
+#include "post/psy_common.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <mutex>
 
 namespace rmps::post {
@@ -27,13 +29,14 @@ double bark_of_hz(double f_hz) {
 // A loud band sits around 1e14 in these units; we anchor that to ~90 dB SPL,
 // giving the affine map below. The offset is the one tuning knob; everything
 // downstream (ATH floor, level-dependent slope) follows from it coherently.
-constexpr double SPL_OFFSET_DB = -50.0;     // spl ≈ 10·log10(E) + OFFSET
+// Duplicate of the one in psy_common.hpp — both now derive from the same
+// scale accessor so they cannot drift apart or from the headroom shift.
 
 double power_to_spl(double e_band) {
-    return 10.0 * std::log10(std::max(e_band, 1.0)) + SPL_OFFSET_DB;
+    return 10.0 * std::log10(std::max(e_band, 1.0)) + psy::spl_offset_db();
 }
 double spl_to_power(double spl_db) {
-    return std::pow(10.0, (spl_db - SPL_OFFSET_DB) / 10.0);
+    return std::pow(10.0, (spl_db - psy::spl_offset_db()) / 10.0);
 }
 
 // --- Absolute threshold of hearing (Terhardt), dB SPL ---------------------
@@ -59,7 +62,39 @@ struct SfbGeometry {
     /// band — not the band centre — governs whether quantization noise in
     /// the band is audible, so we sample across the band and keep the min.
     std::array<double, NUM_SFB_LONG_> ath_min_db{};
+    /// Total spreading gain into band b, evaluated at a *fixed* reference
+    /// masker level. See `REF_MASKER_SPL_DB`.
+    std::array<double, NUM_SFB_LONG_> spread_norm_ref{};
 };
+
+double spread_db(double dz_bark, double f_masker_khz, double masker_spl_db);
+
+/// Reference masker level for the spreading normalization.
+///
+/// The normalization exists to divide out geometric bias: centre bands have
+/// more neighbours than edge bands, so a raw spreading sum inflates them.
+/// Dividing by Σ_m g(b,m) fixes that — but it also divides out the one thing
+/// the spreading function knows about level. The upward skirt shallows as the
+/// masker gets louder (24 - 0.2·L dB/Bark), so a quiet band spreads *less*;
+/// with self-normalization the narrower numerator and the narrower denominator
+/// cancel and the threshold comes out at the same place. The model ends up
+/// asserting that masking works exactly as well at 40 dB SPL as at 90, which
+/// is false, and it is the reason quiet passages cannot ask for more bits: it
+/// makes e/thr scale-invariant, so nothing downstream can tell loud from
+/// quiet.
+///
+/// Normalizing against a fixed reference level instead removes the geometric
+/// bias and keeps the level dependence. It is also cheaper — the denominator
+/// no longer depends on the signal, so it is cached with the geometry.
+///
+/// Measured: inert. And structurally so, which is the useful part. The
+/// masking model only decides how a frame's bits are *distributed across its
+/// bands*; how many bits the frame gets is set by the rate controller before
+/// the model runs. Scaling every threshold in a frame by a common factor
+/// therefore changes nothing — the quantizer just re-hits the same budget. No
+/// change to the psychoacoustic model, however correct, can make a quiet
+/// frame receive more bits. That has to come from the rate controller.
+constexpr double REF_MASKER_SPL_DB = 70.0;
 
 SfbGeometry compute_geometry(int samplerate_index, int samplerate) {
     SfbGeometry g{};
@@ -83,6 +118,16 @@ SfbGeometry compute_geometry(int samplerate_index, int samplerate) {
             ath_min = std::min(ath_min, ath_db_at(std::max(f, 1.0)));
         }
         g.ath_min_db[b] = ath_min;
+    }
+    for (int b = 0; b < NUM_SFB_LONG_; ++b) {
+        double n = 0.0;
+        for (int m = 0; m < NUM_SFB_LONG_; ++m) {
+            const double dz = g.center_bark[b] - g.center_bark[m];
+            n += std::pow(10.0,
+                          spread_db(dz, g.center_hz[m] / 1000.0,
+                                    REF_MASKER_SPL_DB) / 10.0);
+        }
+        g.spread_norm_ref[b] = n;
     }
     return g;
 }
@@ -223,20 +268,49 @@ MaskingParams make_masking_params(const EncoderState& s) {
     if (s.cfg_mask_lambda_R >= 0.0) {
         p.lambda_R = s.cfg_mask_lambda_R;
     } else {
-        const double br = static_cast<double>(s.mpeg.bitr);
+        const double br = static_cast<double>(s.policy_bitr());
         p.lambda_R = std::max(0.0, (128.0 - br) / 128.0) * 1.0e9;
+        // Floor λ_R so a rate term exists at every bitrate. Above 128 kbps the
+        // schedule above is exactly zero, which turns the beam's objective
+        // (cost + λ_R·bits) into pure cost minimisation under a budget — and
+        // since cost falls monotonically as bits rise, that degenerates to
+        // "spend everything" and stops the perceptual cost from *allocating*
+        // anything. Sweepable with RMPS_LAMBDA_FLOOR.
+        // 1e7, measured. The schedule above reaches exactly zero at 128 kbps
+        // and stays there, which is a discontinuity as much as a policy: λ_R
+        // is 6.25e7 at 120 kbps and 0 at 128. A/B over the testset at 192 and
+        // 320 kbps (`RMPS_LAMBDA_FLOOR`, one binary):
+        //
+        //   floor 1e7:  segSNR 3 better / 1 worse, segSNR_p05 4 / 0,
+        //               hole_rate 1 / 0, nothing worse elsewhere.
+        //   floor 1e8:  segSNR_p05 5 / 1 — including transient_train@320
+        //               -11.49 -> -3.41 dB — but mixed_music segSNR -0.77
+        //               at 192 and -0.48 at 320.
+        //
+        // 1e7 is the value with no losing side worth the name; 1e8 trades the
+        // clip nearest to program material for the synthetic ones. Below about
+        // 126 kbps the schedule is already larger than this, so the floor only
+        // binds where it was zero.
+        static const double floor_lr = [] {
+            if (const char *e = std::getenv("RMPS_LAMBDA_FLOOR")) {
+                const double v = std::atof(e);
+                if (v >= 0.0) return v;
+            }
+            return 1.0e7;
+        }();
+        p.lambda_R = std::max(p.lambda_R, floor_lr);
     }
-    
+
     double alpha = s.cfg_mask_alpha;
     double strict_db = s.cfg_lf_strict_db;
-    if (s.mpeg.bitr < 128) {
+    if (s.policy_bitr() < 128) {
         // Adapt alpha: smoothly scale up to 0.55 at 32 kbps to leverage perceptual NMR masking
-        double factor = (128.0 - static_cast<double>(s.mpeg.bitr)) / (128.0 - 32.0);
+        double factor = (128.0 - static_cast<double>(s.policy_bitr())) / (128.0 - 32.0);
         factor = std::clamp(factor, 0.0, 1.0);
         alpha = alpha + factor * (0.55 - alpha);
 
         // Adapt strict_db: scale down strictness to prevent starving mid/high frequencies
-        double strict_factor = (static_cast<double>(s.mpeg.bitr) - 32.0) / (128.0 - 32.0);
+        double strict_factor = (static_cast<double>(s.policy_bitr()) - 32.0) / (128.0 - 32.0);
         strict_factor = std::clamp(strict_factor, 0.25, 1.0);
         strict_db *= strict_factor;
     }
@@ -244,7 +318,34 @@ MaskingParams make_masking_params(const EncoderState& s) {
     p.alpha = std::clamp(alpha, 0.0, 1.0);
     p.lf_strict_db        = std::max(0.0, strict_db);
     p.lf_strict_cutoff_hz = s.cfg_lf_strict_cutoff_hz;
-    p.waveform_reg        = s.cfg_waveform_reg;
+    // Taper the source-difference leg off at starved rates.
+    //
+    // It weights each band by D/e_ref against the granule's *loudest* band, so
+    // a high band — small energy, therefore small D — scores almost nothing
+    // however badly it is coded, while the bass scores heavily. Raising the
+    // multiplier therefore pulls bits downward. With bits to spare that is a
+    // fair trade and it measured as pure gain (segSNR 2 better / 0 worse at
+    // 64-320 kbps). With bits scarce there is nothing to give up but the top
+    // of the spectrum, and it collapses: at 32-56 kbps, 11 cells of hole rate
+    // regressed against 5 better — hf_hiss_decay 12.1 -> 14.9 % at 56 kbps,
+    // attack_from_silence 18.2 -> 29.7 % at 32 — which is audible exactly as
+    // reported, high frequencies dropping out.
+    //
+    // So hold the old strength at or below WR_LOW_KBPS and ramp to the
+    // configured value by WR_FULL_KBPS.
+    {
+        constexpr double WR_LOW_KBPS  = 64.0;
+        constexpr double WR_FULL_KBPS = 96.0;
+        constexpr double WR_LOW_VALUE = 64.0;   // pre-2026-08-27 default
+        const double br = static_cast<double>(s.policy_bitr());
+        double wr = s.cfg_waveform_reg;
+        if (br > 0.0 && br < WR_FULL_KBPS && wr > WR_LOW_VALUE) {
+            const double t = std::clamp(
+                (br - WR_LOW_KBPS) / (WR_FULL_KBPS - WR_LOW_KBPS), 0.0, 1.0);
+            wr = WR_LOW_VALUE + (wr - WR_LOW_VALUE) * t;
+        }
+        p.waveform_reg = wr;
+    }
     return p;
 }
 
@@ -321,7 +422,19 @@ void compute_masking_thresholds(const EncoderState& s, int ch, int gr,
             t    += masker_power[m] * g;
             norm += g;
         }
-        thr[b] = (norm > 0.0) ? (t / norm) : t;
+        // Self-normalization, which cancels the spreading function's level
+        // dependence (see REF_MASKER_SPL_DB). Normalizing against a fixed
+        // reference level instead is the more defensible model and was tried:
+        // it measured inert, 0.06 dB on the quietest loudness quintile, well
+        // inside the -ffast-math noise floor. The reason is structural — see
+        // below — so it is not kept, since it also perturbs every CBR cell.
+        // RMPS_MASK_REFNORM=1 re-enables it for measurement.
+        static const bool ref_norm = [] {
+            const char *e = std::getenv("RMPS_MASK_REFNORM");
+            return e && std::atoi(e) != 0;
+        }();
+        const double den = ref_norm ? geom.spread_norm_ref[b] : norm;
+        thr[b] = (den > 0.0) ? (t / den) : t;
     }
 
     // 4. Absolute threshold of hearing floor. Uses the band's *minimum* ATH
@@ -352,43 +465,21 @@ void compute_masking_thresholds(const EncoderState& s, int ch, int gr,
         }
     }
 
-    // 5b. Overtone (harmonic) masking adjustment.
-    //     If the signal contains a strong fundamental component, its harmonics are
-    //     subject to additional masking. We detect the fundamental component and
-    //     boost the masking thresholds at its harmonics (2nd to 8th).
-    int fund_bin = -1;
-    double max_val = 0.0;
-    // Scan bins 4 to 120 (roughly 150 Hz to 4.5 kHz at 44.1k)
-    for (int i = 4; i < 120; ++i) {
-        if (mag[i] > max_val) {
-            max_val = mag[i];
-            fund_bin = i;
-        }
-    }
-
-    if (fund_bin >= 0 && max_val > 1000.0) {
-        auto sfb_containing = [&](int bin) {
-            for (int sfb = 0; sfb < NUM_SFB_LONG_; ++sfb) {
-                if (bin >= band_table[sfb] && bin < band_table[sfb + 1]) {
-                    return sfb;
-                }
-            }
-            return -1;
-        };
-
-        for (int k = 2; k <= 8; ++k) {
-            int harm_bin = k * fund_bin;
-            if (harm_bin >= GRANULE_SAMPLES) break;
-            int sfb = sfb_containing(harm_bin);
-            if (sfb >= 0) {
-                // Harmonically related bands are easier to mask: boost thresholds.
-                const double boost = (k == 2) ? 1.8 : 1.4;
-                thr[sfb] *= boost;
-                if (sfb > 0) thr[sfb - 1] *= 1.15;
-                if (sfb + 1 < NUM_SFB_LONG_) thr[sfb + 1] *= 1.15;
-            }
-        }
-    }
+    // 5b. Overtone (harmonic) masking adjustment — REMOVED.
+    //
+    //     This used to raise the masking threshold on the bands carrying the
+    //     2nd..8th partials (x1.8 on the octave, x1.4 on the rest, x1.15 on
+    //     the neighbours), on the theory that harmonically related components
+    //     mask each other. As a statement about fusion that is defensible; as
+    //     a coding decision it is not. A raised threshold there means the
+    //     partials are the first thing the search gives up, and a partial
+    //     dropped from a series is not masked — it truncates the series and
+    //     changes the timbre, which is audible at any frequency.
+    //
+    //     It also only became *effective* once the harmonic map was corrected
+    //     to a fractional fundamental: with the old integer f0 the boost
+    //     landed on empty spectrum from about the 4th partial upward, so it
+    //     had been quietly aiming at nothing.
 
     // 6. Time axis — pre-masking penalty for transient / pre-window.
     //

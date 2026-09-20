@@ -1,3 +1,4 @@
+#include "core/scale.hpp"
 #include "quant/short_block.hpp"
 #include "quant/quantize.hpp"
 #include "core/encoder_state.hpp"
@@ -7,6 +8,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace rmps::quant {
 
@@ -60,13 +63,25 @@ int quantize_all(int* ix, int gain, int scale,
     const std::int32_t scalei = s.steptabi[static_cast<std::size_t>(g + 127)];
     for (int i = sg.begin; i < sg.begin + sg.len; ++i) {
       const std::int32_t x = s.xrabs[static_cast<std::size_t>(i)];
-      const std::int32_t ln = fx::mulr(x, scalei);
-      int v;
-      if (ln >= 0 && ln < 262144)
-        v = s.int2idx[static_cast<std::size_t>(ln)];
-      else
-        v = 8191;
-      if (v > 8191) v = 8191;
+      // 64-bit: `fx::mulr` returns through `fx::i32`, which wraps, so a loud
+      // coefficient at a fine step used to come back small or negative.
+      const std::int64_t ln = (static_cast<std::int64_t>(x) * scalei +
+                               static_cast<std::int64_t>(0x80000000LL)) >>
+                              32;
+      if (ln < 0 || ln >= 262144) {
+        // Out of the table's domain means this step is too fine for this
+        // granule. Report it the way `quantize()` does — above 8192, which is
+        // the signal every caller here tests for to escalate the gain.
+        //
+        // This used to write 8191 instead: the largest codeable magnitude, on
+        // a *short* block, i.e. a transient. Worse, 8191 is not > 8192, so the
+        // caller's escalation check never fired and the too-fine step was
+        // accepted as if it were a legitimate maximum. Same defect as the long
+        // path's old `else v = 8191`, in the one code path that only ever runs
+        // on attacks.
+        return 16384;
+      }
+      const int v = s.int2idx[static_cast<std::size_t>(ln)];
       ix[i] = v;
       if (v > maxv) maxv = v;
     }
@@ -195,6 +210,7 @@ bool short_block_quantize(int max_bits, int* ix, int gr, int ch, EncoderState& s
 
   // Per-(w, sfb) signal energy (linear, MDCT² scale) for the noise loop.
   std::array<std::array<double, NUM_SFB_SHORT>, NUM_WINDOWS> e_band{};
+  // (filled just below; the subblock_gain search needs it too)
   for (int si = 0; si < nseg; ++si) {
     const Seg& sg = segs[static_cast<std::size_t>(si)];
     if (sg.sfb >= NUM_SFB_SHORT) continue;
@@ -209,6 +225,126 @@ bool short_block_quantize(int max_bits, int* ix, int gr, int ch, EncoderState& s
   // Reserve part2 headroom assuming a modest compress; bin-search huffman gain.
   int compress = 0;
   int target_huff = std::max(0, max_bits - short_part2_length(compress));
+
+  // --- RD search around the heuristic subblock_gain ---------------------
+  //
+  // The peak-ratio rule above is the only thing that ever chose these three
+  // values, and it is a rule about *levels*, not about coded error: it makes
+  // each window's step proportional to its own peak, which is right only if
+  // every window's content is equally worth its bits. Every other side-info
+  // field of a short granule — scalefac_compress here, and on long granules
+  // scalefac_scale, preflag, scfsi and the Huffman regions — is chosen by
+  // comparing coded outcomes. subblock_gain was the one left on a heuristic.
+  //
+  // Only the *differences* between the three windows are free: adding a
+  // constant to all three is the same encode as moving the global gain by
+  // eight table steps, and the bin search re-fits the global gain for every
+  // candidate anyway. So the search is two-dimensional — windows 1 and 2
+  // against window 0 — and +/-1 on each covers it, since one unit is already
+  // 2 dB of step size and the heuristic is not wrong by more than that.
+  //
+  // Candidates are scored by the same perceptually-weighted relative noise the
+  // noise-shaping loop below minimises, so the two agree about what "better"
+  // means, and only candidates that fit the budget are eligible.
+  // RMPS_SBG_RD=0 disables the search and keeps the heuristic.
+  static const bool sbg_rd = [] {
+    const char* e = std::getenv("RMPS_SBG_RD");
+    return !(e && std::atoi(e) == 0);
+  }();
+  static const bool sbg_debug = std::getenv("RMPS_SBG_DEBUG") != nullptr;
+  if (sbg_rd) {
+    auto weight_for = [](int sfb) {
+      if (sfb <= 1) return 12.0;
+      if (sfb <= 3) return 4.0;
+      if (sfb <= 5) return 1.5;
+      return 1.0;
+    };
+    // Weighted relative noise of the current ix at this (gain, sbg).
+    auto score_of = [&](int g_fit, const std::array<int, NUM_WINDOWS>& cand) {
+      double acc = 0.0;
+      for (int si = 0; si < nseg; ++si) {
+        const Seg& sg = segs[static_cast<std::size_t>(si)];
+        if (sg.sfb >= NUM_SFB_SHORT) continue;
+        const double eb =
+            e_band[static_cast<std::size_t>(sg.w)][static_cast<std::size_t>(sg.sfb)];
+        if (eb <= 0.0) continue;
+        const int g = eff_gain(g_fit, scale, 0, cand[static_cast<std::size_t>(sg.w)]);
+        const std::int32_t scalei = s.steptabi[static_cast<std::size_t>(g + 127)];
+        const double dequant =
+            (scalei > 0) ? 4294967296.0 / static_cast<double>(scalei) : 0.0;
+        double noise = 0.0;
+        for (int i = sg.begin; i < sg.begin + sg.len; ++i) {
+          const double xhat =
+              tables::pow43_tab[static_cast<std::size_t>(ix[i])] * dequant;
+          const double diff =
+              static_cast<double>(s.xrabs[static_cast<std::size_t>(i)]) - xhat;
+          noise += diff * diff;
+        }
+        acc += (noise / eb) * weight_for(sg.sfb);
+      }
+      return acc;
+    };
+
+    const std::array<int, NUM_WINDOWS> base = sbg;
+    // Evaluate a candidate; returns false if it does not fit the budget.
+    // Fit a candidate the same way the main path does — bin-search the gain,
+    // then coarsen until it actually fits. The bin search alone routinely
+    // overshoots the budget (the main path has a "hard budget enforcement"
+    // loop after it for exactly that reason), so testing its raw output
+    // against `max_bits` rejects every candidate including the heuristic, and
+    // the search silently does nothing.
+    auto try_cand = [&](const std::array<int, NUM_WINDOWS>& cand, double& out) {
+      int g = short_bin_search(target_huff, ix, gi, scale, sf, cand, segs, nseg, s);
+      if (quantize_all(ix, g, scale, sf, cand, segs, nseg, s) > 8192) {
+        ++g;
+        if (quantize_all(ix, g, scale, sf, cand, segs, nseg, s) > 8192) return false;
+      }
+      int huff = short_huffman_bits(ix, gi);
+      const int p2 = short_part2_length(compress);
+      while (p2 + huff > max_bits && g < 127) {
+        ++g;
+        quantize_all(ix, g, scale, sf, cand, segs, nseg, s);
+        huff = short_huffman_bits(ix, gi);
+      }
+      if (p2 + huff > max_bits) return false;
+      out = score_of(g, cand);
+      return true;
+    };
+
+    // Score the heuristic first and require a strict improvement to leave it,
+    // so a tie — or a candidate the budget rejects — keeps the old behaviour.
+    std::array<int, NUM_WINDOWS> best_sbg = base;
+    double best_score = 0.0;
+    const bool base_ok = try_cand(base, best_score);
+    if (!base_ok) best_score = 1e300;
+    for (int d1 = -1; d1 <= 1; ++d1) {
+      for (int d2 = -1; d2 <= 1; ++d2) {
+        if (d1 == 0 && d2 == 0) continue;
+        std::array<int, NUM_WINDOWS> cand = base;
+        cand[1] = std::clamp(base[1] + d1, 0, 7);
+        cand[2] = std::clamp(base[2] + d2, 0, 7);
+        if (cand == best_sbg) continue;   // clamped back onto an evaluated one
+        double sc = 0.0;
+        const bool ok = try_cand(cand, sc);
+        if (sbg_debug)
+          std::fprintf(stderr, "[sbg-c] d=%+d,%+d ok=%d score=%.4g (base %.4g)\n",
+                       d1, d2, static_cast<int>(ok), sc, best_score);
+        if (ok && sc < best_score) {
+          best_score = sc;
+          best_sbg = cand;
+        }
+      }
+    }
+    if (sbg_debug) {
+      static long calls = 0, moved = 0;
+      ++calls;
+      if (best_sbg != base) ++moved;
+      std::fprintf(stderr, "[sbg] calls=%ld moved=%ld base=%d,%d,%d -> %d,%d,%d\n",
+                   calls, moved, base[0], base[1], base[2],
+                   best_sbg[0], best_sbg[1], best_sbg[2]);
+    }
+    sbg = best_sbg;
+  }
 
   int gain = short_bin_search(target_huff, ix, gi, scale, sf, sbg, segs, nseg, s);
   int maxv = quantize_all(ix, gain, scale, sf, sbg, segs, nseg, s);
@@ -226,6 +362,9 @@ bool short_block_quantize(int max_bits, int* ix, int gr, int ch, EncoderState& s
   // instead. A strong low-frequency weight keeps the bass alive through the
   // attack, which is exactly where its quant noise is otherwise audible.
   constexpr int MAX_SHAPE_ITERS = 40;
+  // How far a fully-zeroed cell outranks a merely noisy one when choosing
+  // which band gets the next scalefactor step.
+  constexpr double DEAD_CELL_PRIORITY = 8.0;
   constexpr int SF_CAP = 15; // upper sf bound (compress selection enforces real cap)
   auto lf_weight = [](int sfb) {
     // Bass (sfb 0 ≈ 0–460 Hz) and low-mids weighted far above the rest.
@@ -255,7 +394,16 @@ bool short_block_quantize(int max_bits, int* ix, int gr, int ch, EncoderState& s
         noise += diff * diff;
       }
       // Relative noise (1.0 == band fully lost) times the LF perceptual weight.
-      const double score = (noise / eb) * lf_weight(sg.sfb);
+      double score = (noise / eb) * lf_weight(sg.sfb);
+      // A cell coded to nothing outranks any amount of coarseness in a cell
+      // that still carries something. beam_search charges its own surcharge
+      // for this on long granules; short granules never pass through it, and
+      // they are exactly where the measured holes are (transient_train at 64
+      // kbps: 20-35 % of cells between 345 Hz and 2.4 kHz).
+      bool dead = true;
+      for (int i = sg.begin; i < sg.begin + sg.len && dead; ++i)
+        if (ix[i] != 0) dead = false;
+      if (dead) score *= DEAD_CELL_PRIORITY;
       if (score > worst_score) { worst_score = score; worst_w = sg.w; worst_sfb = sg.sfb; }
     }
     if (worst_w < 0) break;
@@ -327,7 +475,7 @@ bool short_block_quantize(int max_bits, int* ix, int gr, int ch, EncoderState& s
   gi.preflag = 0;
   gi.scalefac_compress = compress;
   gi.quantizerStepSize = gain;
-  gi.global_gain = gain + 210;
+  gi.global_gain = gain + 210 + scale::global_gain_offset();
   gi.part2_length = short_part2_length(compress);
   gi.part2_3_length = gi.part2_length + huff;
 

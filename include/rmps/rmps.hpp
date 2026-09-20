@@ -17,6 +17,17 @@ struct PcmChunk {
     std::size_t         num_samples;   ///< total interleaved samples
 };
 
+/// Scalefactor band edges for a coded sample rate, as MDCT line indices:
+/// `long_edges` has 23 entries over 576 lines (21 coded bands + sfb 21 +
+/// end), `short_edges` 14 entries over 192 lines per window. Empty for an
+/// unsupported rate. Hz of line k is k * samplerate / 1152 for long blocks and
+/// k * samplerate / 384 for short ones.
+struct BandLayout {
+    std::vector<int> long_edges;
+    std::vector<int> short_edges;
+};
+BandLayout band_layout(int samplerate);
+
 class Encoder {
 public:
     /// Construct from a public config. Returns null on bad samplerate/bitrate.
@@ -28,6 +39,10 @@ public:
 
     /// Number of PCM frames the encoder consumes per call to encode().
     std::size_t samples_per_pass() const noexcept;
+
+    /// Sample rate the stream is actually coded at. Differs from the input's
+    /// when the encoder resampled — see `Config::coded_samplerate`.
+    int coded_samplerate() const noexcept;
 
     /// Encode a chunk of exactly `samples_per_pass()` PCM frames *per channel*
     /// (interleaved). Returns the encoded MP3 bytes for one MP3 frame. The
