@@ -1,4 +1,5 @@
 #pragma once
+#include "bend/bend.hpp"
 #include "control/transient_gate.hpp"
 #include "core/bitstream.hpp"
 #include "core/side_info.hpp"
@@ -419,6 +420,14 @@ struct EncoderState {
   /// as random "boff" sounds), since outer_loop uses default SF=0 /
   /// compress=0 vs beam_search's optimised choices.
   int frame_outer_loop_fallbacks = 0;
+
+  // ----- Circuit bends (Ali Modular) -----
+  /// The caller's bends, written through Encoder::bends() between frames.
+  EncoderBends bends{};
+  /// What they remember from frame to frame.
+  bend::State bend{};
+  /// Config::fast_quantizer: skip beam_search, go straight to outer_loop.
+  bool cfg_fast_quantizer = false;
 };
 
 } // namespace rmps

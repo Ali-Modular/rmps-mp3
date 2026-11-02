@@ -1,4 +1,5 @@
 #pragma once
+#include "rmps/bend.hpp"
 #include "rmps/config.hpp"
 #include "rmps/stats.hpp"
 #include "rmps/version.hpp"
@@ -69,6 +70,12 @@ public:
 
     /// Mutate the runtime CBR/ABR target. For ABR, sets PID setpoint.
     void set_target_kbps(int kbps);
+
+    /// The circuit bends, read at the start of every frame. See bend.hpp.
+    EncoderBends& bends() noexcept;
+
+    /// What the bends did to the last frame encoded.
+    const BendView& bend_view() const noexcept;
 
 private:
     Encoder();

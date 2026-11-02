@@ -254,6 +254,18 @@ struct Config {
   double hf_ext_obj_gain_db = 0.0;
   double hf_ext_res_gain_db = -1.0;
   double hf_ext_tilt_db_oct = 0.0;
+
+  // --- Real time (Ali Modular) ---
+  /// Quantize every long granule with the rate loop alone (`outer_loop`, a
+  /// global-gain bisection) instead of the beam search. The beam search is
+  /// what this encoder's quality is made of, and it is also ~95 % of its
+  /// time: measured at 128 kbps, 2.2x real time with it and 36x without. An
+  /// encoder that has to keep up with an audio callback cannot afford it.
+  bool fast_quantizer = false;
+  /// Bank bits across frames. Off, every frame carries its own main data and
+  /// main_data_begin stays 0, which removes the frames of output lag the
+  /// reservoir adds - the same switch as RMPS_NO_RESV, as a setting.
+  bool bit_reservoir = true;
 };
 
 } // namespace rmps

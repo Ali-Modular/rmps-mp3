@@ -62,6 +62,8 @@ add_library(rmps STATIC
     src/control/demand.cpp
     src/control/transient_gate.cpp
     src/encoder.cpp
+    src/bend/bend.cpp
+    src/decode/decoder.cpp
 )
 target_include_directories(rmps
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include

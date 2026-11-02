@@ -1,4 +1,5 @@
 #include "core/mdct.hpp"
+#include "bend/bend.hpp"
 #include "core/encoder_state.hpp"
 #include "core/fixed.hpp"
 #include "core/subband.hpp"
@@ -145,9 +146,12 @@ void analyse(EncoderState &s, int stride) {
         int row0[32], row1[32];
         subband::window_filter(ch, row0, s, stride);
         subband::window_filter(ch, row1, s, stride);
+        // The fold bend picks which analysed subband lands in each slot.
+        // At its default every band is its own source.
         for (int b = 0; b < SUBBANDS; ++b) {
-          s.l3_sb_sample[ch][gr + 1][k][b] = row0[b];
-          s.l3_sb_sample[ch][gr + 1][k + 1][b] = row1[b];
+          const int src = bend::fold_source(b, s.bends.fold);
+          s.l3_sb_sample[ch][gr + 1][k][b] = src < 0 ? 0 : row0[src];
+          s.l3_sb_sample[ch][gr + 1][k + 1][b] = src < 0 ? 0 : row1[src];
         }
         // Compensate filter polarity on odd subband indices (analysis side).
         for (int b = 1; b < SUBBANDS; b += 2) {
@@ -199,6 +203,9 @@ void analyse(EncoderState &s, int stride) {
                               : (bt == BLOCK_STOP) ? s.mdct_cos_stop
                                                    : s.mdct_cos_l;
         std::int32_t mdct_in[36];
+        // The alias bend's coefficients - the standard's own when it is off.
+        const std::int32_t *bf_ca, *bf_cs;
+        bend::butterflies(s, g_ca.data(), g_cs.data(), bf_ca, bf_cs);
         for (int band = 0; band < SUBBANDS; ++band) {
           for (int k = 0; k < K_PER_GRANULE; ++k) {
             mdct_in[k] = s.l3_sb_sample[ch][gr][k][band];
@@ -250,13 +257,15 @@ void analyse(EncoderState &s, int stride) {
               // without measuring an actual decode.
               std::int32_t dre, dim;
               cmuls(s.mdct_freq[ch][gr][idx_curr], s.mdct_freq[ch][gr][idx_prev],
-                    g_cs[i], g_ca[i], dre, dim);
+                    bf_cs[i], bf_ca[i], dre, dim);
               s.mdct_freq[ch][gr][idx_curr] = dre;
               s.mdct_freq[ch][gr][idx_prev] = dim;
             }
           }
         }
       }
+      // Warp, smear and freeze, on the finished spectrum.
+      bend::spectrum(s, ch, gr);
     }
 
     // Slide latest granule's subband samples back into slot 0.

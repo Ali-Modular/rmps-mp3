@@ -449,6 +449,10 @@ void decide_block_types(EncoderState& s) {
       }
     }
 
+    // The window bend overrides the gate; the reconciliation below still
+    // makes whatever it asks for a legal sequence.
+    desired = bend::window(s, desired);
+
     // Reconcile against the previous granule's block type so the emitted
     // sequence is always a legal window-switching transition:
     //   LONG  -> LONG | START          STOP  -> LONG | START

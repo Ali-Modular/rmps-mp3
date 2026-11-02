@@ -857,6 +857,8 @@ constexpr double PRUNE_SUBMASK_DB_MARGIN = 0.25;
         fill_spectral_holes(s, ch, gr, cut_bin);
       }
       auto *ix = s.l3_enc[ch][gr].data();
+      // The mask bend, now that this granule's thresholds exist.
+      bend::prune(s, ch, gr);
       s.xr = s.mdct_freq[ch][gr].data();
 
       s.xrsq.fill(0);
@@ -950,6 +952,10 @@ constexpr double PRUNE_SUBMASK_DB_MARGIN = 0.25;
       // Hard cap: never let the running frame total exceed what the slot +
       // real reservoir can physically hold (see frame_hard_bits above).
       max_bits = std::min(max_bits, std::max(0, frame_hard_bits - frame_md_used));
+      // The starve bend takes its share last, after every rule above has had
+      // its say, so what it removes is a fraction of the real grant.
+      const int bend_granted = max_bits;
+      max_bits = bend::starve(s, max_bits);
 
       for (auto &v : s.scalefactor.l[gr][ch])
         v = 0;
@@ -1031,7 +1037,11 @@ constexpr double PRUNE_SUBMASK_DB_MARGIN = 0.25;
             (bt_g == BLOCK_START || bt_g == BLOCK_STOP)
                 ? std::max(0, max_bits - 128)
                 : max_bits;
-        BeamResult br = beam_search(beam_budget, ix, gr, ch, s, gr0_ptr);
+        // Config::fast_quantizer leaves br.ok false, which is the outer_loop
+        // fallback below.
+        BeamResult br{};
+        if (!s.cfg_fast_quantizer)
+          br = beam_search(beam_budget, ix, gr, ch, s, gr0_ptr);
         if (!br.ok) {
           ++s.frame_outer_loop_fallbacks;
           if (std::getenv("RMPS_BOFF_DEBUG")) {
@@ -1213,6 +1223,7 @@ constexpr double PRUNE_SUBMASK_DB_MARGIN = 0.25;
         gi.block_type = s.block_type[ch][gr];
         gi.mixed_block_flag = 0;
       }
+      bend::account(s, bend_granted, gi.part2_3_length);
 
       // Whatever this granule did not use flows back into the pool
       // (clamped at 0: the black-spot guard may exceed the advisory

@@ -463,6 +463,7 @@ struct Encoder::Impl {
         state.cfg_adaptive_ms   = c.adaptive_joint_stereo;
         state.ms_prev_frame     = true;
         state.cfg_block_switching = c.block_switching;
+        state.cfg_fast_quantizer = c.fast_quantizer;
         state.prev_block_type   = {BLOCK_LONG, BLOCK_LONG};
         {
             double hf_thr = c.short_block_hf_threshold;
@@ -507,6 +508,7 @@ struct Encoder::Impl {
         // encoder's own accounting is self-consistent.
         if (const char *e = std::getenv("RMPS_NO_RESV"))
             if (std::atoi(e) != 0) state.ResvMax = 0;
+        if (!c.bit_reservoir) state.ResvMax = 0;
         state.ResvSize = 0;
         // Reset the cross-frame reservoir/FIFO state for this stream.
         state.md_fifo.clear();
@@ -841,6 +843,7 @@ struct Encoder::Impl {
         // spectrum it is about to pay for. The alternative — choosing the rate
         // from PCM-domain heuristics and last frame's SDR — is what left decay
         // tails starved.
+        bend::begin_frame(state);
         control::decide_block_types(state);
         mdct::analyse(state, stride);
 
@@ -870,6 +873,7 @@ struct Encoder::Impl {
 
         quant::iteration_loop(state);
         l3::format_bitstream(state);
+        bend::end_frame(state);
     }
 
     void copy_output() {
@@ -1407,6 +1411,10 @@ const AbrState* Encoder::abr_state() const noexcept {
     st = impl_->abr->state();
     return &st;
 }
+
+EncoderBends& Encoder::bends() noexcept { return impl_->state.bends; }
+
+const BendView& Encoder::bend_view() const noexcept { return impl_->state.bend.view; }
 
 void Encoder::set_target_kbps(int kbps) {
     if (impl_->abr) {
