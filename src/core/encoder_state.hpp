@@ -9,11 +9,62 @@
 #include "rmps/stats.hpp"
 
 #include <array>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
 
 namespace rmps {
+
+/// The quantizer's magnitude map: i^(3/4), rounded with the encoder's 0.0946
+/// bias, for i in [0, 262144). Hosted builds keep it as a 1 MB table.
+///
+/// RMPS_COMPACT_TABLES is for targets with far less RAM than that (the Daisy
+/// has 1 MB of internal SRAM in all). It keeps the table only below
+/// kSmall, 8 kB, which is where nearly every lookup lands once the search
+/// has found its step, and computes the rest from two single-precision
+/// square roots. The table part is exact. Measured on x86, the computed part
+/// is off by one at a rounding boundary on 87 of its inputs, and all 87 are
+/// above kSmall, so computing all of it would give the same output.
+/// Computing every entry, without the table, cost the Cortex-M7's short-block
+/// search half its time: the search quantizes all 576 lines on every step.
+struct Int2Idx {
+#if defined(RMPS_COMPACT_TABLES)
+  static constexpr std::size_t kSmall = 4096;
+  void build() noexcept {
+    for (std::size_t i = 0; i < kSmall; ++i)
+      small[i] = static_cast<std::uint16_t>(std::pow(static_cast<double>(i), 0.75) - 0.0946 + 0.5);
+  }
+  int operator[](std::size_t i) const noexcept {
+    if (i < kSmall)
+      return small[i];
+    const float r = std::sqrt(static_cast<float>(i));
+    return static_cast<int>(r * std::sqrt(r) - 0.0946f + 0.5f);
+  }
+
+private:
+  std::array<std::uint16_t, kSmall> small{};
+#else
+  void build() noexcept {
+    for (std::size_t i = 0; i < t.size(); ++i)
+      t[i] = static_cast<int>(std::pow(static_cast<double>(i), 0.75) - 0.0946 + 0.5);
+  }
+  int operator[](std::size_t i) const noexcept { return t[i]; }
+
+private:
+  std::array<int, 262144> t{};
+#endif
+};
+
+struct MpegState;
+
+/// Sets the slots (bytes) per frame for the current bitrate, as a whole part
+/// and a fraction, from `samplerate`. In integers: in floating point
+/// 1152/32000 is not exact, and at 32 kHz 56, 96, 192 and 224 kbps came out a
+/// hair under a whole number of slots. Those frames were then signalled as
+/// padded while carrying the unpadded length, and every decoder lost sync.
+inline void set_frame_slots(MpegState &m, int samplerate);
 
 /// Mirrors Encoder's EncoderMpeg.
 struct MpegState {
@@ -38,6 +89,13 @@ struct MpegState {
   int mode_ext = 0;
   Mode mode = Mode::JointStereo;
 };
+
+inline void set_frame_slots(MpegState &m, int samplerate) {
+  const long long num = static_cast<long long>(m.granules_per_frame) * 576 * 1000 * m.bitr;
+  const long long den = static_cast<long long>(samplerate) * m.bits_per_slot;
+  m.whole_slots_per_frame = static_cast<int>(num / den);
+  m.frac_slots_per_frame = static_cast<double>(num % den) / static_cast<double>(den);
+}
 
 struct WaveState {
   int channels = 2;
@@ -158,7 +216,7 @@ struct EncoderState {
   // ----- loop tables (initialised once) -----
   std::array<double, 256> steptab{};
   std::array<std::int32_t, 256> steptabi{};
-  std::array<int, 262144> int2idx{};
+  Int2Idx int2idx{};
 
   // ----- scratch buffers for best_subdivide_rd -----
   struct SubdivideScratch {

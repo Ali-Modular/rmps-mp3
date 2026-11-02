@@ -74,11 +74,7 @@ int switch_bitrate(EncoderState& s, double new_kbps) {
 
     s.mpeg.bitrate_index = idx;
     s.mpeg.bitr          = snapped;
-    const double avg_slots =
-        (s.mpeg.granules_per_frame * 576.0 / s.wave.samplerate)
-        * (1000.0 * snapped / s.mpeg.bits_per_slot);
-    s.mpeg.whole_slots_per_frame = static_cast<int>(avg_slots);
-    s.mpeg.frac_slots_per_frame  = avg_slots - s.mpeg.whole_slots_per_frame;
+    set_frame_slots(s.mpeg, s.wave.samplerate);
     return snapped;
 }
 

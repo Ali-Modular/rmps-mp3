@@ -15,6 +15,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
+#include <new>
 #include <vector>
 
 namespace rmps::quant {
@@ -220,7 +222,7 @@ QuantOut quantize_band(const std::int32_t *xrabs_band, int n,
                        std::int64_t scalei_global,
                        [[maybe_unused]] double steptab_global, int sf,
                        int scale, int preflag, int sfb,
-                       const std::array<int, 262144> &int2idx, double alpha,
+                       const Int2Idx &int2idx, double alpha,
                        double zero_boost_factor = 1.0,
                        double zero_fill_exp = 1.0,
                        const int *prev_ix_band = nullptr,
@@ -2052,6 +2054,28 @@ void materialize_ix(
   }
 }
 
+using BandCache =
+    std::array<std::array<CacheEntry, SF_MAX_CANDIDATE + 1>, NUM_SFB_LONG>;
+
+/// The search's per-band candidate cache, cleared as a fresh local would be.
+/// It is 173 kB, more than a small target's whole stack (the Daisy has about
+/// 33 kB), so it lives on the heap, one per thread, built on first use.
+BandCache &fresh_band_cache() {
+#if defined(RMPS_NO_THREADS)
+  static std::unique_ptr<BandCache> c;
+#else
+  thread_local std::unique_ptr<BandCache> c;
+#endif
+  if (!c)
+    return *(c = std::make_unique<BandCache>());
+  for (auto &row : *c)
+    for (auto &e : row) {
+      e.~CacheEntry();
+      ::new (&e) CacheEntry{};
+    }
+  return *c;
+}
+
 } // namespace
 
 /// Phase timing for the search (RMPS_PROF=1): where the effort goes.
@@ -2095,8 +2119,7 @@ BeamResult beam_search(int max_bits, int *ix, int gr, int ch, EncoderState &s,
   std::array<std::array<std::int16_t, NUM_RATE_BUCKETS>, NUM_SFB_LONG>
       dp_prev{};
 
-  std::array<std::array<CacheEntry, SF_MAX_CANDIDATE + 1>, NUM_SFB_LONG>
-      cache{};
+  BandCache &cache = fresh_band_cache();
   auto &cod = s.side_info.gr[gr].ch[ch].tt;
   const auto &band_table =
       tables::scale_fact_band_index[s.mpeg.samplerate_index];

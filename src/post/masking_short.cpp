@@ -1,11 +1,11 @@
 #include "post/masking_short.hpp"
 #include "post/psy_common.hpp"
 #include "core/encoder_state.hpp"
+#include "core/sync.hpp"
 #include "core/tables.hpp"
 
 #include <algorithm>
 #include <cmath>
-#include <mutex>
 
 namespace rmps::post {
 
@@ -91,8 +91,8 @@ ShortGeometry compute_short_geometry(int samplerate_index, int samplerate) {
 const ShortGeometry& short_geometry_for(int samplerate_index, int samplerate) {
     static std::array<ShortGeometry, tables::NUM_SAMPLERATES> cache{};
     static std::array<bool, tables::NUM_SAMPLERATES> ready{};
-    static std::mutex mu;
-    std::lock_guard<std::mutex> lk(mu);
+    static sync::Mutex mu;
+    sync::Lock lk(mu);
     const auto idx = static_cast<std::size_t>(samplerate_index);
     if (!ready[idx]) {
         cache[idx] = compute_short_geometry(samplerate_index, samplerate);

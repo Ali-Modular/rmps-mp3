@@ -8,6 +8,7 @@ encoder is bit-identical to upstream.
 1. **A decoder**: `rmps::Decoder`, `include/rmps/decoder.hpp`.
 2. **Circuit bends** in the encoder and the decoder: `include/rmps/bend.hpp`.
 3. **Two real-time switches** in `Config`: `fast_quantizer` and `bit_reservoir`.
+4. **Two build switches for small targets**: `RMPS_COMPACT_TABLES` and `RMPS_NO_THREADS`.
 
 ## Why
 
@@ -64,6 +65,35 @@ Hook points, all marked in the source:
 
 - **`Config::fast_quantizer`**: every long granule goes to `outer_loop` (the global-gain bisection) instead of `beam_search`. At 128 kbps that's 2.2× → 36× real time. Quality drops to roughly shine's.
 - **`Config::bit_reservoir`**: `false` sets `ResvMax = 0`, the same as `RMPS_NO_RESV=1` but as a setting. Every frame carries its own main data, so output stops lagging by up to five frames.
+
+## Small targets
+
+Two compile-time switches, for building the library on a microcontroller
+(Artifact's Daisy Patch firmware uses both). Neither changes a hosted build.
+
+- **`RMPS_COMPACT_TABLES`**: the quantizer's magnitude map `int2idx`
+  (i^(3/4) with the encoder's rounding bias, for i up to 262144) keeps only
+  its first 4096 entries as a table (8 kB) and computes the rest from two
+  single-precision square roots. It is `rmps::Int2Idx` in
+  `src/core/encoder_state.hpp`. The computed part differs from the full table
+  on 87 of its inputs (measured on x86), each off by one at a rounding
+  boundary. The encoder's state is 160 kB this way. Nearly every lookup lands
+  in the table, which matters on a microcontroller: computing every entry cost
+  the Cortex-M7's short-block search about half its time.
+- **`RMPS_NO_THREADS`**: the four locks guarding the lazily built tables
+  (band geometry, short-block geometry, demand geometry, perceptual weights)
+  become no-ops, through `src/core/sync.hpp`. Toolchains built without
+  threads, such as arm-none-eabi's, have no `std::mutex`.
+
+With both, every source in the library builds with arm-none-eabi-g++ 10 for
+the Cortex-M7, at `-std=gnu++20 -fno-exceptions -fno-rtti`.
+
+One change applies to every build: the beam search's per-band candidate
+cache (173 kB) is no longer a local. It lives on the heap, one per thread,
+and is cleared at the start of each search as the local was, so the output is
+bit-identical (checked at 32 and 48 kHz, 64 to 320 kbps). As a local it was
+more than a microcontroller's whole stack. The search still takes 35 kB of
+stack on the M7, so a small target needs a stack of 64 kB or so.
 
 ## Tested
 

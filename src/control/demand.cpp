@@ -1,5 +1,6 @@
 #include "control/demand.hpp"
 #include "core/encoder_state.hpp"
+#include "core/sync.hpp"
 #include "core/tables.hpp"
 #include "post/perceptual.hpp"
 #include "post/psy_common.hpp"
@@ -8,7 +9,6 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
-#include <mutex>
 
 namespace rmps::control {
 
@@ -75,8 +75,8 @@ Geom build_geom(int samplerate_index, int samplerate) {
 const Geom& geom_for(int samplerate_index, int samplerate) {
     static std::array<Geom, tables::NUM_SAMPLERATES> cache{};
     static std::array<bool, tables::NUM_SAMPLERATES> ready{};
-    static std::mutex mu;
-    std::lock_guard<std::mutex> lk(mu);
+    static sync::Mutex mu;
+    sync::Lock lk(mu);
     const auto idx = static_cast<std::size_t>(samplerate_index);
     if (!ready[idx]) {
         cache[idx] = build_geom(samplerate_index, samplerate);

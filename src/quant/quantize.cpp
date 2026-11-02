@@ -32,9 +32,7 @@ void initialise(EncoderState& s) {
             ? 0x7fffffff
             : (v < 0.5 ? 0 : static_cast<std::int32_t>(v + 0.5));
     }
-    for (int i = 0; i < 262144; ++i) {
-        s.int2idx[i] = static_cast<int>(std::pow(static_cast<double>(i), 0.75) - 0.0946 + 0.5);
-    }
+    s.int2idx.build();
 }
 
 /// Scaled magnitude of `x` at this step size, in the `int2idx` domain.

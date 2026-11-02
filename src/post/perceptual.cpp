@@ -1,9 +1,9 @@
 #include "post/perceptual.hpp"
+#include "core/sync.hpp"
 #include "core/tables.hpp"
 
 #include <algorithm>
 #include <cmath>
-#include <mutex>
 #include <unordered_map>
 
 namespace rmps::post {
@@ -29,14 +29,14 @@ struct CacheHash { std::size_t operator()(const CacheKey& k) const noexcept {
 }};
 
 std::unordered_map<CacheKey, std::array<double, NUM_SFB_LONG_>, CacheHash> g_cache;
-std::mutex g_cache_mu;
+sync::Mutex g_cache_mu;
 
 } // namespace
 
 const std::array<double, NUM_SFB_LONG_>&
 perceptual_weights(int samplerate_index, int samplerate, bool is_side_channel) {
     CacheKey key {samplerate_index, is_side_channel};
-    std::lock_guard<std::mutex> lk(g_cache_mu);
+    sync::Lock lk(g_cache_mu);
     auto it = g_cache.find(key);
     if (it != g_cache.end()) return it->second;
 

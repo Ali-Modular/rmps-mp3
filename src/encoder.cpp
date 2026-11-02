@@ -379,11 +379,7 @@ struct Encoder::Impl {
             state.mpeg.mode_ext = 0;
         }
 
-        const double avg_slots =
-            (state.mpeg.granules_per_frame * 576.0 / state.wave.samplerate)
-            * (1000.0 * state.mpeg.bitr / state.mpeg.bits_per_slot);
-        state.mpeg.whole_slots_per_frame = static_cast<int>(avg_slots);
-        state.mpeg.frac_slots_per_frame  = avg_slots - state.mpeg.whole_slots_per_frame;
+        set_frame_slots(state.mpeg, state.wave.samplerate);
         state.mpeg.slot_lag              = -state.mpeg.frac_slots_per_frame;
         if (state.mpeg.frac_slots_per_frame == 0.0) state.mpeg.padding = 0;
 
@@ -744,6 +740,10 @@ struct Encoder::Impl {
             else
                 state.mpeg.padding = 0;
             state.mpeg.slot_lag += (state.mpeg.padding - state.mpeg.frac_slots_per_frame);
+        } else {
+            // A whole number of slots never pads, including just after a
+            // bitrate switch away from a rate that did.
+            state.mpeg.padding = 0;
         }
         state.mpeg.bits_per_frame =
             8 * (state.mpeg.whole_slots_per_frame + state.mpeg.padding);
