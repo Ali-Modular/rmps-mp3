@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace rmps::bend {
 
@@ -105,29 +106,72 @@ void spectrum(EncoderState& s, int ch, int gr) {
         for (int i = 0; i < GRANULE_SAMPLES; ++i)
             held[i] = std::fabs(static_cast<float>(xr[i]));
     }
-
-    for (int i = 0; i < GRANULE_SAMPLES; ++i)
-        b.building.after[i] += std::fabs(static_cast<float>(xr[i])) * kViewScale;
     ++b.view_granules;
 }
 
 void prune(EncoderState& s, int ch, int gr) {
-    const double db = s.bends.mask_db;
-    if (!(db > -200.0) || s.block_type[ch][gr] == BLOCK_SHORT)
+    const double range_db = s.bends.mask_range_db;
+    if (!(range_db < 200.0) || s.block_type[ch][gr] == BLOCK_SHORT)
         return;
-    const double gain = std::pow(10.0, db / 10.0);
     const auto& mt = s.mask_thresholds[ch][gr];
     const auto& sfb = tables::scale_fact_band_index[s.mpeg.samplerate_index];
     auto& xr = s.mdct_freq[ch][gr];
+
+    // How far each band stands over its threshold, and the most any does.
+    std::array<double, NUM_SFB_LONG> margin{};
+    double best = 0.0;
+    for (int b = 0; b < NUM_SFB_LONG; ++b) {
+        margin[b] = mt.thr[b] > 0.0 ? mt.e_band[b] / mt.thr[b] : 0.0;
+        best = std::max(best, margin[b]);
+    }
+    if (best <= 0.0)
+        return;
+    const double floor = best * std::pow(10.0, -std::max(range_db, 0.0) / 10.0);
+
     bool last_pruned = false;
     for (int b = 0; b < NUM_SFB_LONG; ++b) {
-        last_pruned = mt.e_band[b] < mt.thr[b] * gain;
+        last_pruned = margin[b] < floor;
         if (last_pruned)
             std::fill(xr.begin() + sfb[b], xr.begin() + sfb[b + 1], 0);
     }
     // sfb 21 carries no threshold of its own; it goes with the band below it.
     if (last_pruned)
         std::fill(xr.begin() + sfb[NUM_SFB_LONG], xr.end(), 0);
+}
+
+void coded(EncoderState& s, int ch, int gr, const int* ix) {
+    if (s.block_type[ch][gr] == BLOCK_SHORT || ch > 1)
+        return;
+    State& b = s.bend;
+    auto& out = b.coded[gr][ch];
+    out.fill(0.f);
+    b.coded_valid[gr][ch] = true;
+
+    const auto& gi = s.side_info.gr[gr].ch[ch].tt;
+    const std::int32_t scalei = s.steptabi[std::clamp(gi.quantizerStepSize + 127, 0, 255)];
+    if (scalei <= 0)
+        return;
+    // A decoder's requantization, in the encoder's Q31 units: the line was
+    // quantized as (|xr| * 2^sf * scalei / 2^32)^(3/4), so it comes back as
+    // |ix|^(4/3) * 2^32 / scalei, less the scalefactor's amplification.
+    const double step = 4294967296.0 / static_cast<double>(scalei);
+    const double sf_mult = gi.scalefac_scale ? 1.0 : 0.5;
+    const auto& sfb = tables::scale_fact_band_index[s.mpeg.samplerate_index];
+    const auto& sf = s.scalefactor.l[gr][ch];
+    const auto& xr = s.mdct_freq[ch][gr];
+    // Past big_values and count1 nothing is sent, whatever ix still holds.
+    const int end = std::min(GRANULE_SAMPLES, gi.big_values * 2 + gi.count1 * 4);
+    for (int band = 0; band < NUM_SFB_LONG + 1; ++band) {
+        const int amp = sf[band] + (gi.preflag && band < NUM_SFB_LONG ? tables::pretab[band] : 0);
+        const double k = step * std::exp2(-sf_mult * amp) * kViewScale;
+        for (int i = sfb[band]; i < std::min(sfb[band + 1], end); ++i) {
+            const int q = std::min(std::abs(ix[i]), 8191);
+            if (q == 0)
+                continue;
+            const double v = tables::pow43_tab[static_cast<std::size_t>(q)] * k;
+            out[i] = static_cast<float>(xr[i] < 0 ? -v : v);
+        }
+    }
 }
 
 int starve(const EncoderState& s, int max_bits) noexcept {
@@ -164,10 +208,32 @@ void begin_frame(EncoderState& s) noexcept {
     b.building.bits_granted = 0;
     b.building.short_blocks = false;
     b.view_granules = 0;
+    for (auto& g : b.coded_valid)
+        g.fill(false);
 }
 
 void end_frame(EncoderState& s) noexcept {
     State& b = s.bend;
+
+    // The coded spectra, back to L/R where the frame went out as M/S.
+    const bool ms = s.wave.channels == 2 && (s.mpeg.mode_ext & 2) != 0;
+    constexpr float kInvSqrt2 = 0.70710678f;
+    for (int gr = 0; gr < s.mpeg.granules_per_frame; ++gr) {
+        auto& c = b.coded[gr];
+        const auto& valid = b.coded_valid[gr];
+        if (ms && valid[0] && valid[1]) {
+            for (int i = 0; i < GRANULE_SAMPLES; ++i) {
+                const float m = c[0][i], d = c[1][i];
+                b.building.after[i] += (std::fabs(m + d) + std::fabs(m - d)) * kInvSqrt2;
+            }
+        } else {
+            for (int ch = 0; ch < 2; ++ch)
+                if (valid[ch])
+                    for (int i = 0; i < GRANULE_SAMPLES; ++i)
+                        b.building.after[i] += std::fabs(c[ch][i]);
+        }
+    }
+
     if (b.view_granules > 0) {
         const float k = 1.0f / static_cast<float>(b.view_granules);
         for (int i = 0; i < GRANULE_SAMPLES; ++i) {

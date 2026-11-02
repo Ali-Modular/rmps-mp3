@@ -57,14 +57,18 @@ struct EncoderBends {
     bool freeze = false;
 
     /// ---- Psychoacoustic model ------------------------------------------
-    /// Masking-threshold gain in dB, applied as a prune: any scalefactor band
-    /// whose energy falls under its masking threshold raised by this much is
-    /// zeroed before quantization. Around 0 dB this removes only what the
-    /// model already calls inaudible; above it the model is told far more is
-    /// masked than is, and the spectrum breaks into the isolated, swirling
-    /// partials of a starved stream at any bitrate. Negative infinity (the
-    /// default) is off; anything below -60 dB prunes nothing in practice.
-    double mask_db = -1.0e9;
+    /// A prune, measured against the masking model: each scalefactor band's
+    /// energy over its masking threshold says how far it stands out, and
+    /// every band more than this many dB short of the granule's most audible
+    /// band is zeroed before quantization. Wide, it removes only what the
+    /// model already calls inaudible; narrowed, the spectrum breaks into the
+    /// isolated, swirling partials of a starved stream at any bitrate; at 0
+    /// only the most audible band of each granule survives. It is relative so
+    /// that the same setting does the same thing to any material - an
+    /// absolute gain on the thresholds silences a steady tone outright once
+    /// it passes the tone's own margin, around +20 dB, and does nothing at all
+    /// below +8. Positive infinity (the default) is off. Long blocks only.
+    double mask_range_db = 1.0e9;
 
     /// ---- Rate control --------------------------------------------------
     /// Fraction of each granule's bit grant the quantizer may actually
@@ -109,11 +113,16 @@ struct DecoderBends {
 };
 
 /// What the encoder's bends did to the last frame, for drawing. Magnitudes
-/// are the mean over granules and channels of |line|, normalised so a full-
-/// scale sine's line reads about 1.
+/// are the mean over long-layout granules and both channels (as L/R, whether
+/// or not the frame was coded M/S) of |line|, normalised so a full-scale
+/// sine's line reads about 1.
 struct BendView {
     std::array<float, 576> before{};   ///< long-block spectrum as analysed
-    std::array<float, 576> after{};    ///< the same after the spectral bends
+    /// What the stream carries for the same lines: the quantized values as a
+    /// decoder dequantizes them. So every encoder bend shows here - warp,
+    /// smear and freeze, the mask prune, starve's coarser steps, the bitrate -
+    /// and a line coded to zero reads zero.
+    std::array<float, 576> after{};
     int bits_used = 0;                 ///< part2_3 bits over the frame
     int bits_granted = 0;              ///< before `starve` took its share
     bool short_blocks = false;         ///< any granule coded short

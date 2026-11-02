@@ -45,7 +45,7 @@ level ratio 1.002, 49–52 dB SNR on a pure tone at 128–320 kbps.
 | `alias` | alias-reduction butterflies | Scales each butterfly's *rotation angle* (0 = stage off, 1 = standard) | …replaces the butterfly with a free 2×2 matrix |
 | `warp` | MDCT spectrum | Rescales the frequency axis (line *i* ← line *i*/warp) | …rotates the spectrum by a line offset |
 | `smear`, `freeze` | MDCT spectrum | Peak-hold decay of each line's magnitude, live signs; freeze holds it | …blends magnitudes linearly with the previous frame's |
-| `mask_db` | psychoacoustic model | Zeroes every band under its masking threshold raised by this much | …scales LAME's per-band thresholds |
+| `mask_range_db` | psychoacoustic model | Zeroes every band more than this many dB less audible (energy over masking threshold) than the granule's most audible band | …scales LAME's per-band thresholds |
 | `starve` | rate control | Grants each granule only a fraction of its bits (with a floor) | (a similar squeeze on LAME's target bits) |
 | `window` | transient gate | Forces long or short blocks, legal transitions kept | (no equivalent) |
 | `rot` | decoder, main data | Random bit flips in scalefactors and Huffman data; header and side info left intact | (no decoder bends) |
@@ -55,10 +55,10 @@ level ratio 1.002, 49–52 dB SNR on a pure tone at 128–320 kbps.
 Hook points, all marked in the source:
 
 - `src/core/mdct.cpp`: `fold`, `alias`, then `bend::spectrum` (`warp`, `smear`, `freeze`).
-- `src/quant/iteration_loop.cpp`: `bend::prune` (`mask_db`), `bend::starve`, and `fast_quantizer`.
+- `src/quant/iteration_loop.cpp`: `bend::prune` (`mask_range_db`), `bend::starve`, `bend::coded`, and `fast_quantizer`.
 - `src/control/transient_gate.cpp`: `window`.
 - `src/decode/decoder.cpp`: `rot`, `law`, `loop`.
-- `src/bend/bend.cpp`: the encoder-side implementations, plus `BendView`, the per-frame spectra before and after the bends, for drawing.
+- `src/bend/bend.cpp`: the encoder-side implementations, plus `BendView`, for drawing: each frame's spectrum as analysed, and as coded (the quantized lines dequantized, back in L/R), so every encoder bend shows in it.
 
 ## The real-time switches
 
@@ -74,8 +74,25 @@ extreme setting, compared with the unbent output on the same input:
 
 ```
 fold 12   -0.0 dB    alias 0   -10.5 dB   warp 2    +4.7 dB   smear .97  -0.9 dB
-mask 20dB -0.0 dB    starve .1 -15.1 dB   window long -33.4 dB  window short -17.5 dB
+starve .1 -15.1 dB   window long -33.4 dB  window short -17.5 dB
 rot 1e-4 -17.0 dB    rot 1e-2  -0.8 dB    law 1.0  -12.5 dB    law 1.8  -14.8 dB
 ```
 
 All of them run at 26–35× real time with `fast_quantizer` on.
+
+`mask_range_db` was first an absolute gain on the thresholds (`mask_db`). Swept
+over tones, chords, noise and drums, that did nothing below +8 dB and silenced
+every steady source outright somewhere between +19 and +26 dB, the margin of
+its loudest band, while drums (short blocks) never went below -10 dB. Relative
+to the loudest band it thins every source alike: the share of lines still
+coded, with Artifact's mapping (10 dB × √(1 − knob)):
+
+```
+knob          0    25   50   75   90  100 %
+sine        100    88   75    7    5    2
+saw chord   100    89   57   29   18    2
+white noise 100    95   69   10    8    2
+drums       100    65   49   25   16    2
+```
+
+The most audible band of each long granule is always kept, so it never mutes.

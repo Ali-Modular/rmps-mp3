@@ -4,7 +4,7 @@
 // where they plug in.
 //
 //   mdct::analyse        fold_source, butterflies, spectrum
-//   iteration_loop       prune, starve, account
+//   iteration_loop       prune, starve, coded, account
 //   decide_block_types   window
 //   Encoder::Impl        begin_frame, end_frame
 
@@ -31,6 +31,12 @@ struct State {
 
     std::uint32_t rng = 0x2545F491u;
 
+    /// Each long granule's coded spectrum, signed, in the domain it was coded
+    /// in (L/R or M/S). Turned back into L/R and added to the view at the end
+    /// of the frame, when both channels are in.
+    std::array<std::array<std::array<float, 576>, 2>, 2> coded{};
+    std::array<std::array<bool, 2>, 2> coded_valid{};
+
     BendView building{};   ///< this frame, as it accumulates
     BendView view{};       ///< the last whole frame
     int view_granules = 0;
@@ -50,9 +56,14 @@ void butterflies(EncoderState& s, const std::int32_t* std_ca, const std::int32_t
 /// MDCT. Also records the before/after view. Short granules pass through.
 void spectrum(EncoderState& s, int ch, int gr);
 
-/// The mask bend: zeroes scalefactor bands under their bent threshold. Long
-/// granules only; call after the masking model has run.
+/// The mask bend: zeroes the scalefactor bands that stand too far below the
+/// granule's most audible one. Long granules only; call after the masking
+/// model has run.
 void prune(EncoderState& s, int ch, int gr);
+
+/// Records what a long granule was coded as, for the view's `after`. Call
+/// once the granule's quantization and side info are final.
+void coded(EncoderState& s, int ch, int gr, const int* ix);
 
 /// The starve bend on one granule's grant.
 int starve(const EncoderState& s, int max_bits) noexcept;

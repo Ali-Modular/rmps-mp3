@@ -1223,6 +1223,7 @@ constexpr double PRUNE_SUBMASK_DB_MARGIN = 0.25;
         gi.block_type = s.block_type[ch][gr];
         gi.mixed_block_flag = 0;
       }
+      bend::coded(s, ch, gr, ix);
       bend::account(s, bend_granted, gi.part2_3_length);
 
       // Whatever this granule did not use flows back into the pool
